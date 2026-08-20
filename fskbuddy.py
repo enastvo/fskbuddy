@@ -36,7 +36,21 @@ from transceiver import (
 
 
 def cmd_tui(args):
-    from tui import PocsagTUI
+    try:
+        from tui import PocsagTUI
+    except ModuleNotFoundError as e:
+        if e.name != "textual":
+            raise
+        print("error: the 'textual' package isn't installed for whichever python3 "
+              "just ran this.\n\n"
+              "The tui subcommand needs a venv (the system python3 is externally-"
+              "managed and won't have it) -- see README.md's Setup section:\n\n"
+              "  python3 -m venv --system-site-packages .venv\n"
+              "  .venv/bin/pip install textual\n\n"
+              "then launch with .venv/bin/python3, not plain python3:\n\n"
+              "  .venv/bin/python3 fskbuddy.py " + " ".join(sys.argv[1:]),
+              file=sys.stderr)
+        sys.exit(1)
     # tx_gain/rx_gain default to None here (see build_parser) so, unless the
     # user explicitly passes --tx-gain/--rx-gain, PocsagTUI's own defaults
     # apply (see TUI_DEFAULT_TX_GAIN/RX_GAIN in tui.py) instead of
