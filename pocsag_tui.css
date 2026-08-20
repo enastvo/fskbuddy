@@ -1,0 +1,153 @@
+/* Retro green-phosphor CRT terminal look, modeled on a classic radio
+   control terminal reference: black background, green monospace text,
+   boxed panels with titled borders, function-key-style footer. */
+
+Screen {
+    background: black;
+    color: #33ff33;
+}
+
+#topbar {
+    height: 1;
+    width: 100%;
+    background: black;
+    color: #33ff33;
+    text-style: bold;
+    border-bottom: solid #22aa22;
+    content-align: left middle;
+    padding: 0 1;
+}
+
+#row1 {
+    height: 8;
+    width: 100%;
+}
+
+#row2 {
+    height: auto;
+    width: 100%;
+}
+
+#row3 {
+    height: 1fr;
+    width: 100%;
+}
+
+.panel {
+    border: round #22aa22;
+    background: black;
+    color: #33ff33;
+    padding: 0 1;
+}
+
+.panel Static {
+    background: black;
+    color: #33ff33;
+}
+
+#freq-panel, #settings-panel, #status-panel {
+    width: 1fr;
+    height: 100%;
+}
+
+/* Spectrum scope stacks directly above the waterfall (both full width) so
+   their columns line up -- see render_spectrum_bars/render_waterfall_line,
+   which share the same one-character-per-bin grid. */
+#spectrum-panel {
+    width: 100%;
+    height: 11;
+}
+
+#spectrum-bars {
+    height: 8;
+}
+
+#spectrum-freq-axis {
+    height: 1;
+    color: #22aa22;
+}
+
+#waterfall-panel {
+    width: 100%;
+    height: 18;
+}
+
+#addr-panel {
+    width: 30;
+    height: 100%;
+}
+
+#messages-panel {
+    width: 1fr;
+    height: 100%;
+}
+
+#log-panel {
+    width: 1fr;
+    height: 100%;
+}
+
+#log, #waterfall, #messages {
+    background: black;
+    color: #33ff33;
+    border: none;
+    scrollbar-color: #22aa22;
+    scrollbar-background: black;
+}
+
+Footer {
+    background: black;
+    color: #33ff33;
+}
+
+Footer > .footer--key {
+    background: black;
+    color: #33ff33;
+    text-style: bold;
+}
+
+Footer > .footer--description {
+    background: black;
+    color: #22aa22;
+}
+
+/* Modals */
+
+ModalScreen {
+    align: center middle;
+    background: rgba(0, 0, 0, 0.6);
+}
+
+#tx-modal, #settings-modal, #help-modal {
+    background: black;
+    border: heavy #33ff33;
+    padding: 1 2;
+    width: 64;
+    height: auto;
+    color: #33ff33;
+}
+
+#tx-modal Label, #settings-modal Label, #help-modal Label {
+    color: #33ff33;
+    background: black;
+}
+
+.hint {
+    color: #22aa22;
+    text-style: italic;
+}
+
+#tx-error, #s-error {
+    color: #ff5555;
+    text-style: bold;
+}
+
+Input {
+    background: black;
+    color: #33ff33;
+    border: solid #22aa22;
+}
+
+Input:focus {
+    border: solid #33ff33;
+}

@@ -1,0 +1,503 @@
+# POCSAG pager transceiver
+
+A POCSAG pager transmitter/receiver for the USRP B200mini, built on a
+custom FPGA image (see `../uhd/fpga/usrp3/lib/radio_200/pocsag_*.v` and
+`fsk_demod.v`) that does bit synchronization, batch/frame synchronization,
+and channel filtering in hardware, plus a Python/Textual TUI and CLI on
+top.
+
+## Architecture
+
+**FPGA (real-time PHY, in fabric):**
+- `fsk_demod.v` -- delay-and-multiply FSK discriminator (bit slicer).
+- `pocsag_channel_filter.v` -- 31-tap FIR lowpass (~20kHz cutoff) ahead of
+  the discriminator. Without this, standard POCSAG deviation (+/-4500Hz)
+  doesn't decode at all on real RF -- the discriminator was seeing the
+  DDC's full output bandwidth as noise, hundreds of kHz wide, instead of
+  POCSAG's actual ~15-20kHz channel, which collapses a delay-and-multiply
+  discriminator's SNR (a textbook "FM threshold effect": output SNR scales
+  with deviation^2 for fixed input noise bandwidth). Confirmed empirically
+  with a deviation sweep before this filter existed (0% decode at
+  4.5-15kHz, 100% at 25kHz+); fixed by narrowing the noise bandwidth
+  instead of inflating the deviation, the same approach real POCSAG
+  decoders use (SDRangel's pager demod plugin defaults to a 20kHz RF
+  bandwidth filter, independently matching this design).
+- `pocsag_bitsync.v` -- recovers per-bit timing from the discriminator's
+  oversampled output. Free-running divider with edge-triggered resync
+  *only while unlocked* (gated by `pocsag_framer`'s `locked` signal) --
+  TX and RX share one on-board clock here, so there's no drift to track
+  once locked, and continuously resyncing on every real-RF noise blip
+  turned out to actively hurt reliability (this was a real, measured
+  regression -- see git history/commit notes on the two-part fix).
+- `pocsag_framer.v` -- finds the frame sync word (0x7CD215D8, Hamming-
+  distance-tolerant, resolves 2-FSK polarity ambiguity), shifts out raw
+  32-bit codewords, re-verifies sync every batch.
+- Reachable via `USER_SETTINGS`: `poke32(3*4, {enable,sps})` to configure,
+  `peek64(2*8)` to poll for freshly-captured codewords (see
+  `pocsag_modem.py`'s `REG_POCSAG_CTRL`/`RB_POCSAG_STATUS`).
+- `gsc_framer.v` -- GSC (Golay Sequential Code)'s equivalent of
+  `pocsag_framer.v`, a second bit-timing-recovery (a second
+  `pocsag_bitsync.v` instance, reused as-is at GSC's own 600-baud sps) +
+  block-sync chain running concurrently in fabric off the same `fsk_demod`
+  bit stream. Finds the control-word Word1 pattern (Hamming-tolerant, same
+  technique as `pocsag_framer.v`'s sync word), then tracks subsequent
+  comma-delimited blocks, re-verifying the comma before each one rather
+  than POCSAG's fixed-batch-length resync (see its header for why: this
+  project's own GSC TX convention puts a full comma before every block).
+  Reachable via `poke32(4*4, {enable,sps})` / `peek64(3*8)` (see
+  `pocsag_modem.py`'s `REG_GSC_CTRL`/`RB_GSC_STATUS`). See "GSC support"
+  below for the full caveats on what this protocol implementation is (and
+  isn't) validated against.
+- All of the above tap `ddc_chain`'s `sample_rx`/`strobe_rx`, gated by a
+  dedicated `run_rx_fabric = pocsag_en | gsc_en` (`radio_legacy.v`) --
+  deliberately separate from `run_rx` (which `new_rx_control`/
+  `new_rx_framer` still use, unchanged, to gate the actual host-facing USB
+  packet path). This means the whole custom PHY chain keeps running and
+  decoding purely off USER_SETTINGS register enables, independent of
+  whether the host ever streams/drains raw IQ over USB at all -- see
+  `transceiver.py`'s `PocsagReceiver.start()` for how the host side uses
+  this (skips `stream_cmd`/`recv()` entirely unless the spectrum/waterfall
+  display actually needs sample content).
+
+**Host (this directory):**
+- `pocsag.py` -- protocol library: BCH(31,21) encode/decode with
+  single-bit correction, numeric/alphanumeric message packing, batch/
+  preamble assembly, `LiveParser` for incremental decode of a live
+  codeword stream.
+- `golay.py` / `gsc.py` -- GSC's equivalent of `pocsag.py`: textbook
+  Golay(23,12,7) encode/decode (`golay.py`, spec-independent, cross-checked
+  bit-for-bit against a real reference implementation -- see its
+  docstring) and GSC's own framing/message assembly on top of it
+  (`gsc.py`, with a `LiveParser` mirroring `pocsag.py`'s). See "GSC
+  support" below for what's confirmed-real vs. this project's own
+  convention.
+- `pocsag_modem.py` -- shared UHD plumbing (`open_usrp`, `modulate_cpfsk`,
+  the USER_SETTINGS register addresses). Read its module docstring before
+  touching threading here -- **three threads concurrently doing USB I/O
+  against this device deadlocks it** (confirmed with a minimal repro: not
+  one of three threads completed even a single call). Two is fine. RX
+  draining and register polling must always be the same thread; TX gets
+  its own.
+- `transceiver.py` -- `PocsagReceiver`, `PocsagTransmitter`,
+  `PocsagTransceiver` classes wrapping the above into a reusable API. This
+  is what both the TUI and the CLI (`send`/`listen`) are built on -- not a
+  separate implementation for each front end.
+- `pocsag_tui.py` / `pocsag_tui.css` -- the interactive TUI (Textual).
+- `pocsag_ctl.py` -- combined entry point: `tui` (default), `send`,
+  `listen` subcommands.
+- `pocsag_tx.py` / `pocsag_rx.py` -- older standalone scripts (pre-date
+  `transceiver.py`); still work, but `pocsag_ctl.py send`/`listen` are the
+  same functionality built on the shared classes and are the ones being
+  maintained going forward.
+- `pocsag_test_loopback.py` / `pocsag_test_ota.py` -- validation scripts
+  (internal digital loopback and real same-board over-the-air, respectively).
+- `gsc_test_loopback.py` / `gsc_test_ota_2radio.py` -- GSC's equivalents:
+  digital loopback, and true two-radio over-the-air (one board TX, a
+  genuinely separate one RX -- possible here since two boards are
+  available; POCSAG's own OTA test predates having a second board).
+- `two_radio_streaming_test.py` -- exercises `PocsagReceiver`/
+  `PocsagTransmitter` themselves (not a raw `stream_cmd`/`recv()` script
+  like the others above) over real two-radio RF, both protocols, with no
+  `on_spectrum` given -- i.e. the register-poll-only USB streaming mode
+  described in "USB streaming" below, the thing that actually changes
+  when that mode is used.
+- `addresses.json` -- capcode -> nickname address book, used by the TUI.
+- `station.json` -- this station's own capcode (Settings -> "Our address"),
+  purely identifying/informational; see the promiscuous-receive note below.
+- `logs/` -- one plain-text file per TUI session (`pocsag_YYYYMMDD_HHMMSS.log`,
+  created on launch, path also announced in ACTIVITY LOG), mirroring both
+  ACTIVITY LOG and MESSAGES -- neither panel is otherwise persisted
+  anywhere, so this is what there is to go back and review after a run
+  ends. Not rotated/pruned automatically; delete old ones by hand.
+
+## Setup
+
+The TUI needs `textual`, which needs installing into a venv (the system
+Python is externally-managed / Debian-policy-locked). The venv must see
+the system-installed `uhd` Python bindings, hence `--system-site-packages`:
+
+```
+python3 -m venv --system-site-packages .venv
+.venv/bin/pip install textual
+```
+
+(`pocsag_ctl.py send`/`listen` and the plain scripts only need `numpy` +
+`uhd`, already available system-wide -- the venv is only required for the
+`tui` subcommand.)
+
+## Usage
+
+```
+.venv/bin/python3 pocsag_ctl.py                 # TUI (default)
+.venv/bin/python3 pocsag_ctl.py tui --no-rx      # TUI, don't auto-start RX
+.venv/bin/python3 pocsag_ctl.py tui --no-spectrum --no-waterfall  # hide/skip both panels
+
+python3 pocsag_ctl.py send --address 1234567 --alpha "hello world"
+python3 pocsag_ctl.py send --address 1234568 --numeric "18005551234"
+python3 pocsag_ctl.py listen --duration 30 --address 1234567
+```
+
+`--freq`, `--rate`, `--bitrate` (512/1200/2400), `--deviation` are
+available on all three subcommands; TX/RX gain flags differ slightly by
+subcommand (see `--help`).
+
+### Multiple boards
+
+If more than one B200mini is plugged in, all three subcommands prompt for
+which one to use (a numbered list, `uhd.find()` under the hood -- the same
+discovery `uhd_find_devices` uses, just returned as data instead of
+printed):
+
+```
+2 B200mini devices found:
+  [1] serial=3103D0D  product=B200mini
+  [2] serial=3103D16  product=B200mini
+Select device [1-2]:
+```
+
+Pass `--serial <serial>` to skip the prompt (scriptable/non-interactive
+use); with only one board connected it's picked automatically, no prompt
+either way.
+
+### TUI keys
+
+| Key | Action |
+|---|---|
+| `t` | Transmit (compose: address or saved nickname, type, message) |
+| `r` | Toggle RX on/off |
+| `s` | Settings (TX/RX gain, bitrate, address filter, our address) |
+| `c` | Save the last-seen address to the address book |
+| `h` / `?` | Help |
+| `q` | Quit (closes the device cleanly) |
+
+Layout is modeled on a retro green-phosphor radio control terminal
+(titled, bordered panels; live clock; function-key-style footer) -- see
+the reference image this was built against. Panels: FREQUENCY/MODE,
+RADIO SETTINGS, STATUS (RIG/RX/LOCK/CLIPPING/counts), SPECTRUM SCOPE,
+WATERFALL, MEMORY (address book), MESSAGES, ACTIVITY LOG.
+
+MESSAGES is a decluttered, color-coded RX/TX log -- just address, saved
+nickname (if any), and message text, blue for received and red for
+transmitted (`RX_MSG_COLOR`/`TX_MSG_COLOR` in `pocsag_tui.py`) -- kept
+deliberately separate from ACTIVITY LOG, which still gets its own fuller
+line for the same event (gain/bitrate changes, batch sync acquired/lost,
+codeword-decode failures, etc.) alongside everything else it already
+logged. A codeword BCH can't correct (`pocsag.py`'s `bch_decode` returns
+`None`) now surfaces there too as `decode FAILED: codeword 0x... (...)`
+instead of being silently dropped -- wired through `LiveParser`'s
+`on_error` hook in `transceiver.py`'s `_run()`. (Deliberately not raised
+for an address with no message words before the next one -- that's normal
+for a spec-compliant tone-only/ring-only page, not a decode failure.)
+
+That same "codeword BCH can't correct" case used to cause a worse, silent
+failure than just a missed page: `LiveParser` (and `parse_codewords()`)
+dropped the bad codeword but left whatever page was already in progress
+pending. If the bad codeword was actually meant to be the *next* page's
+address word (indistinguishable from a bad message word once BCH fails --
+the flag bit that would tell them apart lives inside the payload that
+didn't decode), that next page's real message codewords would silently
+get appended onto the *previous*, unrelated page's buffer instead, and the
+following flush would emit one page carrying the old address but a
+garbled splice of two different pages' text -- reproduced directly
+(`'AAAAA'` became `'AAAAA@PPPP\x10'` once a second page's address word was
+corrupted). This is the likely cause of MESSAGES occasionally showing a
+wrong-looking message. Fixed by discarding whatever's pending on any
+decode failure instead of leaving it around to be contaminated -- losing
+an in-flight page outright is strictly better than emitting one with
+mismatched address/content.
+
+The receiver is promiscuous by default -- neither the FPGA (no
+address-match register exists in `pocsag_framer.v`/the `USER_SETTINGS`
+block) nor `pocsag.py`'s decode path filter by capcode; every decodable
+page on the tuned frequency is received and logged regardless of address.
+The "Address filter" field in Settings (blank by default, shown as
+`ALL (promiscuous)` in the STATUS panel) narrows the *display* to one
+capcode -- it doesn't change what's actually received, and `n_pages`/
+`Codewords` in STATUS keep counting everything either way (see
+`PocsagReceiver._run()` in `transceiver.py`). Settings' separate "Our
+address" field (persisted to `station.json`) is this station's own
+capcode for reference -- purely identifying, not a filter; it doesn't
+change what's received or displayed.
+
+SPECTRUM SCOPE and
+WATERFALL can each be hidden with `--no-spectrum`/`--no-waterfall` (see
+Usage above); when both are given the underlying FFT is skipped entirely,
+not just the panels hidden -- see `PocsagReceiver.on_spectrum` in
+`transceiver.py`, which is left `None` (rather than a no-op callback) in
+that case so `_run()`'s `if ... is not None` check bypasses the FFT call
+altogether.
+
+The spectrum scope and waterfall are computed live from real RX samples
+(a throttled FFT inside the existing RX thread -- no extra device I/O, no
+new thread) -- not simulated. The FFT is cropped to the center
+`SPECTRUM_DISPLAY_SPAN_HZ` (`transceiver.py`, default 150kHz -- POCSAG's
+own channel is only ~15-20kHz wide, no need to show the full Nyquist
+span) and binned to `SPECTRUM_NBINS` columns (150, i.e. 1kHz/bin by
+default). A frequency-axis line (left/center/right, in MHz) runs under
+the bars -- note this means the panel needs a terminal at least
+`SPECTRUM_NBINS` columns wide (150) to show the whole thing un-clipped.
+
+The spectrum scope (green, a live multi-row bar chart using eighth-block
+sub-character resolution) sits directly above the waterfall, both using
+the exact same one-character-per-bin grid so a signal in one lines up in
+the same column in the other. The waterfall itself is colored by an RGB
+thermal heatmap (blue -> cyan -> green -> yellow -> red -- deliberately
+not the rest of the UI's green theme), scaled against a slowly-adapting
+floor/ceiling so a real signal shows as a bright band against a stable
+background instead of every row always spanning the full color range. It
+updates on its own, much slower cadence than the live bars
+(`WATERFALL_INTERVAL_S` in `pocsag_tui.py`, derived from
+`WATERFALL_MAX_LINES=200` for a 10-minute horizon -- ~3s between rows) so
+that horizon doesn't scroll out of view in under a minute.
+
+It's a *falling* waterfall -- each new row enters at the top and existing
+rows fall toward the bottom, oldest falling off the bottom once
+`WATERFALL_MAX_LINES` is full, the direction real spectrogram displays
+use (not the "rises from the bottom" direction a naive scrolling log
+would give you for free -- Textual's `RichLog` only supports appending at
+the bottom, so this is done by rebuilding the visible buffer from a
+newest-first `deque` on every waterfall tick; see
+`PocsagTUI._handle_spectrum`/`render_waterfall_rows`). A time-scale label
+(`-0:00`, `-1:00`, ... how long ago that row was captured) is appended
+after every 20th row (~once a minute) as a trailing suffix, not a prefix,
+so it doesn't disturb the left-edge column alignment with the spectrum
+bars above.
+
+**CLIPPING** in the Status panel flags RX front-end saturation -- dial RX
+gain down in Settings (`s`) if you see it. Detected in FPGA fabric
+(`clip_detect.v`, tapped pre-channel-filter off the same `sample_rx`/
+`strobe_rx` the channel filter itself uses), not by scanning every sample
+in Python: a free-running `clip_count` (same diff-against-last-seen-value
+idiom `pocsag_framer.v` already uses for codeword count) exposed via
+`RB_PHY_STATUS` (`peek64(4*8)`), replacing an O(n) `np.max(np.abs(buf))`
+scan every RX loop iteration with one cheap register read. The magnitude
+threshold was empirically calibrated against real hardware (a temporary
+peak-hold diagnostic register, since removed, compared fabric's raw
+I^2+Q^2 against the host's own peak during deliberate extreme overdrive) --
+confirmed to within 1 LSB of the intended 95%-of-full-scale trip point, not
+just assumed correct from datasheet math. One caveat found while building
+this: at
+*extreme* overdrive (e.g. both TX and RX pinned near max on a short/strong
+link) the receiver can stop returning usable samples almost entirely, and
+in that specific regime the CLIPPING flag may not light up either -- but
+`LOCK: no` / `Codewords: 0` persisting indefinitely is already an
+unambiguous sign something's wrong even then. This is exactly what an
+empirical two-board gain sweep found on real hardware: `TUI_DEFAULT_TX_GAIN`/
+`TUI_DEFAULT_RX_GAIN` (`pocsag_tui.py`) used to be pinned to the B200mini's
+hardware ceilings (TX 89.75dB, RX 76dB) on the theory that there's no
+single sane default across setups -- but at typical close range between
+two separate radios, that combo reliably saturated the receiver
+(CLIPPING, no LOCK, nothing decodes). The defaults are now 50dB TX/65dB
+RX, the combo that sweep found actually locks and decodes cleanly; still
+just a starting point to dial in for your own antenna distance/link
+budget, not a guarantee for every setup.
+
+**Channel** (12.5kHz "narrow" vs 25kHz "wide") in the FREQUENCY/MODE panel
+auto-detects the RX channel width in FPGA fabric (`channel_width_detect.v`),
+shown as "detecting..." until it settles. Rather than running a second
+bandpass filter pair to measure occupied bandwidth directly (the literal
+approach, which would need ~32 more DSP48A1 multiplies -- this design
+didn't have them spare, 112 of 132 already used), it estimates FSK
+deviation from the statistical swing of `fsk_demod.v`'s own discriminator
+output (exposed via new `disc_out`/`disc_valid` ports) relative to the
+signal's own power -- narrower-channel conventions use smaller deviation,
+wider use larger, and normalizing by power keeps the classification
+gain-independent (confirmed: re-measured at two very different gain
+settings and got the same ratio). Empirically calibrated against real
+hardware transmitting known 2000Hz and 4500Hz deviations through this
+project's own TX chain at a genuinely locked, decoding link -- measured
+ratios were within 0.4% of the small-angle theoretical prediction
+(2*pi*f_dev/sample_rate), and the ratio between them (~2.26x) matched the
+deviation ratio (4500/2000 = 2.25x) almost exactly. Debounced over 8
+consecutive ~4ms windows (~33ms) before latching a classification change,
+same "commit only after sustained agreement" pattern `pocsag_bitsync.v`
+already established. Purely informational for now -- it doesn't yet
+change filter/deviation handling (the channel filter is still one fixed
+~20kHz-cutoff design); see the project's plan notes for the follow-on work
+that would act on it.
+
+## GSC support
+
+GSC (Golay Sequential Code) is a second paging protocol, decoded/encoded
+concurrently with POCSAG by its own fabric chain (`gsc_bitsync`/
+`gsc_framer.v`) rather than a separate build -- select which one
+`PocsagReceiver`/`PocsagTransceiver` actually listens to and decodes via
+`protocol="pocsag"|"gsc"` (the other chain's register just gets disabled,
+see `transceiver.py`); TX protocol defaults to match but can be overridden
+per-`send()` call.
+
+Framing (comma/gap structure, LSB-first doubled-bit transmission, Golay
+FEC) and several real constants (control/activation codewords, preamble
+values, address-word table, alpha/numeric character tables) are adopted
+directly from **multimon-ng**'s real, independent, field-used GSC decoder
+(`demod_gsc.c`/`bch.c`, public domain, github.com/EliasOenal/multimon-ng)
+and cross-checked against a primary source, US Patent 4,427,980 (which
+describes GSC as background art, not its own invention) -- see `gsc.py`'s
+module docstring for the full, source-by-source breakdown of what's
+confirmed-real versus this project's own convention.
+
+**What's still this project's own convention, not real GSC**, and why:
+real GSC's Word2 -> address-digit arithmetic is a genuine, citable
+mixed-radix algorithm (multimon-ng's `reverse_word2()`) intricate enough
+that fully inverting it into an encoder wasn't done here -- `gsc.py` uses a
+direct bit-packed address mapping instead. Real GSC also uses a separate,
+smaller BCH(15,7) code for data blocks (distinct from address/control's
+Golay(23,12)) -- not adopted; this implementation uses Golay(23,12)
+uniformly rather than add a second FEC implementation for a
+self-consistent system. Neither omission affects whether this project's
+own TX and RX talk to each other correctly, only interop with a real GSC
+network -- which is moot regardless: GSC infrastructure is defunct, and
+unlike POCSAG (validated against SDRangel/multimon-ng's own POCSAG
+support), there's no independent GSC implementation to interop-test
+against, so validation here is limited to this project's own
+self-consistency (build a bitstream, feed it through the FPGA framer or a
+software-simulated receiver, confirm it comes back out correctly), the
+same real limitation the POCSAG section above documents plainly rather
+than overclaiming.
+
+`gsc_framer.v` mirrors `pocsag_framer.v`'s division of labor exactly
+(framing/PHY in fabric, Golay decode and message assembly in host
+software via `golay.py`/`gsc.py`'s `LiveParser`) but differs in lock
+strategy: POCSAG re-verifies its fixed 32-bit sync word once per 16-word
+batch, while GSC has no such fixed batch length to fall back on, so
+`gsc_framer.v` instead re-verifies a 28-symbol alternating comma before
+*every* block (matching this project's own TX convention of prefixing
+every block with one, not just the first) -- a bit slip self-heals at the
+next block instead of the next batch.
+
+Verified on real hardware: digital loopback (`gsc_test_loopback.py` /
+`PocsagTransceiver(protocol="gsc")`) and true two-radio over-the-air
+(`gsc_test_ota_2radio.py` -- one B200mini transmitting, a genuinely
+separate one receiving over real antennas, not the same-board TRX->RX2
+trick `pocsag_test_ota.py` uses). Both: a single page transmits and decodes
+with the exact expected address and message. The OTA test needed the same
+real-two-board gain defaults already established for POCSAG (50dB TX/65dB
+RX, not the same-board test's much lower 15dB/35dB -- a genuine
+antenna-to-antenna link budget, not near-zero same-board leakage) and the
+same larger-than-spec deviation trick (25kHz, swamps this board's
+~3.4kHz DC-offset artifact) `pocsag_test_ota.py` already validated on the
+identical shared PHY (channel filter, discriminator) GSC's own framer sits
+downstream of. One real,
+characterized edge case turned up along the way and is worth knowing
+about: if a transmission's trailing control word is immediately followed
+by another transmission's own fresh preamble with *zero* gap (concatenating
+repeat bursts bit-for-bit, the way POCSAG's `repeat=` does safely), the
+comma-based resync can transiently mistake preamble content for a comma+
+word pair -- both are alternating patterns. This is always safe (Golay's
+error threshold on the host side rejects the resulting garbage, never
+producing a corrupted page) and self-healing (a fresh correlation search
+re-finds the next real control word within tens of symbols), but can
+briefly cost throughput right at that boundary -- confirmed empirically:
+zero-gap back-to-back repeats occasionally dropped a repeat's page outright
+(safely, not corrupted -- just missing), a real gap between them didn't.
+Fixed on the TX side rather than by making the framer's resync more
+elaborate: `PocsagTransmitter.send()` inserts a real ~100ms RF-silence gap
+between GSC repeats (`GSC_INTER_REPEAT_GAP_S`, `transceiver.py`) instead of
+concatenating them; confirmed clean (2/2 repeats decoded, zero spurious
+errors) with the default `repeat=2` afterward. POCSAG doesn't need this --
+its framer resyncs via a direct 32-bit sync-word correlation, immune to
+"this looks alternating" confusion, so its own repeats stay concatenated
+with no gap.
+
+## USB streaming
+
+`PocsagReceiver` skips streaming raw IQ over USB entirely when nothing
+needs the sample content -- i.e. whenever `on_spectrum` isn't given
+(`pocsag_ctl.py listen`/`send`, or the TUI with both the spectrum and
+waterfall panels hidden, since `pocsag_tui.py` already funnels both into
+one `on_spectrum` callback: `want_spectrum = self.show_spectrum or
+self.show_waterfall`). Before this, `start()`/`_run()` issued
+`stream_cmd(start_cont)` and called `rx_streamer.recv()` unconditionally,
+every loop iteration, regardless of whether anything used the result --
+at 1MSPS with the `sc16` wire format (4 bytes/sample), that's a continuous
+~32Mbps of USB traffic just to keep decode working, even for a purely
+headless listener that only ever reads `peek64` registers.
+
+Root cause (confirmed by reading the RTL, not assumed): the whole custom
+PHY chain (`pocsag_channel_filter`, `fsk_demod`, both bitsync/framer
+pairs, `clip_detect`, `channel_width_detect`) taps `ddc_chain`'s own
+`sample_rx`/`strobe_rx`, and `ddc_chain`'s `run` input used to be the same
+`run_rx` signal `new_rx_control`/`new_rx_framer` use to gate the
+host-facing USB packet path (`uhd/fpga/usrp3/lib/vita_200/new_rx_control.v`:
+`assign run = (ibs_state == IBS_RUNNING)`, deasserted the instant the
+downstream framing FIFO reports full). So the decimator -- and everything
+downstream of it in fabric -- silently stalled whenever the host stopped
+draining, confirmed empirically before the fix: `stream_cmd(start_cont)`
+issued once with zero subsequent `recv()` calls showed zero register
+progress for a full 6 seconds. Fixed with a dedicated
+`run_rx_fabric = pocsag_en | gsc_en` (`radio_legacy.v`) driving only
+`ddc_chain`'s `run` input -- `new_rx_control`/`new_rx_framer`/both
+`gpio_atr` ATR instances keep using the original `run_rx`, completely
+unchanged, so the actual USB packet path still gates exactly as before.
+`ddc_chain`'s `run` port was already a plain level-sensitive enable
+throughout (CORDIC, CIC strober, both halfband decimators -- see
+`uhd/fpga/usrp3/lib/dsp/ddc_chain.v`), so decoupling it was safe: the only
+other effect of holding it low was resetting the NCO phase accumulator,
+harmless to avoid by holding it at 1 whenever either protocol's decode is
+enabled.
+
+Verified on real hardware, both before and after: with the fix, the same
+zero-`recv()`-calls test that previously stalled for the full 6-second
+poll window now shows register-poll-only progress within the first
+100ms. End-to-end confirmed over true two-radio RF too
+(`two_radio_streaming_test.py` -- one board TX, a genuinely separate one
+RX via `PocsagReceiver` with no `on_spectrum`, `receiver._streaming ==
+False` the whole time): both POCSAG and GSC pages decode correctly with
+zero `rx_streamer.recv()` calls on the RX board for the entire session.
+Streaming mode (spectrum/waterfall on) was re-verified unchanged
+alongside it. One real bug found and fixed along the way: the initial
+register-poll-only loop paced itself with the same 0.3s sleep `recv()`
+used to block for, which is far slower than data actually arrives (a
+32-bit POCSAG codeword every ~13.3ms at 2400bps) -- since the status
+registers hold only the latest codeword/word pair (no queue), a slow poll
+doesn't just add latency, it silently loses codewords/blocks. Fixed by
+polling every 2ms instead (cheap -- `peek64` is a register read, not a USB
+bulk transfer).
+
+## POCSAG spec compliance
+
+Core framing matches spec and is validated end-to-end on real hardware:
+preamble, 0x7CD215D8 sync word, 8-frame/16-codeword batches, BCH(31,21)
+with single-bit correction (double-bit errors are detected, not corrected
+-- standard practice, matches most real-world decoders), 3-bit
+frame-number address encoding, both numeric and alphanumeric message
+types, standard bit rates (512/1200/2400), and -- after the channel filter
+fix -- standard +/-4500Hz deviation, with 100% exact-match decode measured
+across a real TX(TRX)->air->RX(RX2) link at every deviation from 4.5kHz to
+25kHz.
+
+Two things worth knowing:
+- **Numeric character table**: verified against two independent
+  transcriptions of the spec's Table 1 (0x0-0x9 digits, 0xA spare/
+  reserved, 0xB 'U', 0xC space, 0xD hyphen, 0xE ']', 0xF '['). An earlier
+  version of this table was wrong (guessed from memory, not checked) --
+  digits 0-9 were always right, but 4 of the 6 special-character
+  positions weren't. Fixed and cross-checked against the spec's own
+  stated padding value (space = code 1100 = 0xC), which only lines up
+  with the corrected table.
+- **Function bits**: the spec leaves their meaning carrier-defined. This
+  implementation uses the common convention (function 3 = alphanumeric,
+  else numeric), which is reasonable but not *the* standard -- there
+  isn't one.
+
+Not implemented (not required for spec-compliant framing, real pagers use
+these for other reasons): address-based frame-skip for battery saving
+(a receiver optimization, not a framing requirement), and POCSAG doesn't
+have a 4-level FSK mode at all (that's FLEX) so there's nothing missing
+there. `PocsagTransmitter.send()` does repeat each page's full
+preamble+batch(es) twice in one burst by default (`repeat=` parameter) --
+real systems commonly repeat pages for reliability; a single one-shot
+burst measurably has less decode margin than a repeated one.
+
+## Known hardware quirk
+
+Every script here reliably segfaults (or, occasionally, aborts with a
+glibc "double free" message) a moment after finishing -- always *after*
+all real work is done and logged, confirmed repeatedly with unbuffered
+output and headless test harnesses that assert success before the crash
+happens. This is a host-side UHD/pybind teardown-ordering issue in this
+environment (likely toolchain-version related -- this UHD build runs
+against a newer GCC/Boost/CPython than it's typically tested with), not a
+device or logic problem: `uhd_find_devices` confirms the board is healthy
+immediately after every occurrence. Treat a nonzero exit code alongside
+expected output/log lines as a pass, not a failure.
