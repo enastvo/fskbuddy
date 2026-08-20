@@ -14,7 +14,7 @@ import datetime
 import json
 import threading
 import time
-from collections import deque
+from collections import deque, namedtuple
 from pathlib import Path
 
 from textual import work
@@ -72,9 +72,26 @@ _EIGHTHS = " ▁▂▃▄▅▆▇█"  # index = eighths filled, 0..8
 
 # Messages panel: a decluttered RX/TX-only view, color-coded, separate from
 # the noisier technical ACTIVITY LOG (sync/gain/decode-failure lines etc).
-RX_MSG_COLOR = "#4499ff"  # blue -- received
-TX_MSG_COLOR = "#ff5555"  # red -- transmitted (same red already used for
-                           # errors/CLIPPING elsewhere in the UI)
+# Three colors, in priority order (see PocsagTUI._message_color):
+#   1. OWN_MSG_COLOR  -- we sent it ourselves (direction == "TX"). Always
+#      wins even in the edge case of paging your own capcode -- "this is
+#      mine" is the more useful signal than "this was addressed to me".
+#   2. TO_US_MSG_COLOR -- someone else's page addressed to our own capcode
+#      (Settings' "Our address" / station.json) -- likely meant for us.
+#   3. RX_MSG_COLOR   -- everything else received (promiscuous RX means
+#      that's most traffic on a shared frequency).
+RX_MSG_COLOR = "#4499ff"     # blue -- received, not addressed to us specifically
+OWN_MSG_COLOR = "#888888"    # gray -- we sent it (dimmed -- you already know what you sent)
+TO_US_MSG_COLOR = "#ffdd33"  # yellow -- received, addressed to our own capcode
+
+# One record per logged message, kept around (PocsagTUI.messages) so the
+# panel can be fully re-rendered on demand -- needed for the "hide own
+# messages" filter to apply retroactively to everything already logged,
+# not just new messages from the moment you toggle it. is_own is exactly
+# (direction == "TX") -- POCSAG/GSC pages carry no real sender field, so
+# "from us" is knowable only for messages this station itself transmitted;
+# a received page's actual origin is simply unknowable from the protocol.
+Message = namedtuple("Message", "ts direction to_address to_name message is_own")
 
 
 def render_spectrum_bars(mags, floor, ceil, rows=SPECTRUM_BAR_ROWS, color=SPECTRUM_BAR_COLOR):
@@ -376,8 +393,15 @@ class HelpModal(ModalScreen):
                 "s   settings (frequency, gains, bitrate, address filter, our address --\n"
                 "    only transmit on a frequency you're actually licensed to use)\n"
                 "c   add current/last-seen address to address book\n"
+                "o   hide/show messages we sent ourselves in MESSAGES\n"
                 "h/? this help\n"
                 "q   quit\n\n"
+                "MESSAGES panel: each entry shows To:/From: clearly -- From\n"
+                "is US for anything we transmitted (dimmed gray) or RF for\n"
+                "anything received (POCSAG/GSC carry no real sender field,\n"
+                "so RF is as specific as it gets). A received page addressed\n"
+                "to our own capcode (Settings' \"Our address\") is highlighted\n"
+                "yellow instead of the default blue.\n\n"
                 "PHY (bit sync, batch/frame sync, ~20kHz channel filter) runs\n"
                 "in FPGA fabric; BCH decode and message assembly happen here\n"
                 "in software. See pocsag/README.md for the full writeup.\n\n"
@@ -399,6 +423,7 @@ class PocsagTUI(App):
         Binding("r", "toggle_rx", "Toggle RX"),
         Binding("s", "settings", "Settings"),
         Binding("c", "add_contact", "Add contact"),
+        Binding("o", "toggle_own_filter", "Hide own"),
         Binding("h,question_mark", "help", "Help"),
         Binding("q", "quit", "Quit"),
     ]
@@ -433,6 +458,9 @@ class PocsagTUI(App):
         self.n_pages_rx = 0
         self.n_pages_tx = 0
         self.last_seen_address = None
+        self.messages = []  # full history, see the Message namedtuple above -- re-rendered
+                             # from this on every new message and every filter toggle
+        self.hide_own_messages = False
         self._spec_floor = None
         self._spec_ceil = None
         self._last_waterfall_t = 0.0
@@ -504,7 +532,7 @@ class PocsagTUI(App):
                 yield Static(id="addr-content")
 
             messages_panel = Vertical(id="messages-panel", classes="panel")
-            messages_panel.border_title = "MESSAGES (RX blue / TX red)"
+            messages_panel.border_title = "MESSAGES (own gray / to-you yellow) ('o' hides own)"
             with messages_panel:
                 # min_width=1, not the RichLog default of 78: with wrap=True
                 # and the default shrink=True on write(), RichLog still
@@ -596,21 +624,61 @@ class PocsagTUI(App):
             pass
         self._write_log_file(msg)
 
-    def _log_message(self, direction, color, address, name, message):
-        """The decluttered MESSAGES panel -- just RX/TX content, color-coded
-        (see RX_MSG_COLOR/TX_MSG_COLOR), separate from ACTIVITY LOG's fuller
-        technical detail (which still gets its own line too, unchanged)."""
+    def _log_message(self, direction, to_address, message):
+        """Records one message (RX or TX) and re-renders the whole
+        MESSAGES panel from history -- see the Message namedtuple and
+        _render_messages for why a full rebuild rather than an append
+        (the "hide own" filter needs to apply retroactively). The log
+        file, unlike the live panel, always gets every message regardless
+        of the filter -- filtering is a display concern, not what's kept
+        for after-the-fact review."""
         ts = datetime.datetime.now().strftime("%H:%M:%S")
-        who = f" ({name})" if name else ""
+        is_own = (direction == "TX")
+        name = lookup_name(self.address_book, to_address)
+        record = Message(ts, direction, to_address, name, message, is_own)
+        self.messages.append(record)
+        who = " (you)" if to_address == self.own_address else (f" ({name})" if name else "")
+        self._write_log_file(f"MSG {direction}  to={to_address}{who}: {message!r}")
+        self._render_messages()
+
+    def _message_color(self, record):
+        """Priority order -- see the color constants' own comments for
+        the reasoning: own (gray) beats addressed-to-us (yellow) beats
+        plain received (blue)."""
+        if record.is_own:
+            return OWN_MSG_COLOR
+        if record.to_address == self.own_address:
+            return TO_US_MSG_COLOR
+        return RX_MSG_COLOR
+
+    def _render_messages(self):
+        """Full rebuild from self.messages, same "clear + rewrite"
+        approach render_waterfall_rows already uses for a similar need
+        (a toggle -- there, WATERFALL_MAX_LINES trimming; here,
+        hide_own_messages -- that has to apply to everything already
+        logged, not just what's appended from here on)."""
         try:
-            self.query_one("#messages", RichLog).write(
-                f"[{color}]{ts}  {direction}  {address}{who}: {message}[/{color}]")
+            log = self.query_one("#messages", RichLog)
         except Exception:
-            pass
-        self._write_log_file(f"MSG {direction}  addr={address}{who}: {message!r}")
+            return
+        log.clear()
+        for record in self.messages:
+            if self.hide_own_messages and record.is_own:
+                continue
+            color = self._message_color(record)
+            from_label = "US" if record.is_own else "RF"
+            who = " (you)" if record.to_address == self.own_address else (
+                f" ({record.to_name})" if record.to_name else "")
+            log.write(f"[{color}]{record.ts}  To: {record.to_address}{who}   "
+                      f"From: {from_label}[/{color}]")
+            log.write(f"[{color}]  {record.message}[/{color}]")
+        log.scroll_end(animate=False)
 
     def _refresh_panels(self):
         try:
+            hidden_note = " -- own hidden ('o' to show)" if self.hide_own_messages else " ('o' hides own)"
+            self.query_one("#messages-panel", Vertical).border_title = (
+                f"MESSAGES (own gray / to-you yellow){hidden_note}")
             if not self.channel_width_locked:
                 channel_str = "detecting..."
             elif self.channel_width_narrow:
@@ -669,7 +737,7 @@ class PocsagTUI(App):
         who = f" ({name})" if name else ""
         self._log(f"RX  addr={page.address}{who} func={page.function} "
                    f"type={page.msg_type} msg={page.message!r}")
-        self._log_message("RX", RX_MSG_COLOR, page.address, name, page.message)
+        self._log_message("RX", page.address, page.message)
         self._refresh_panels()
 
     def _on_status(self, **kw):
@@ -749,7 +817,7 @@ class PocsagTUI(App):
             name = lookup_name(self.address_book, address)
             who = f" ({name})" if name else ""
             self._log(f"TX  addr={address}{who} func={function} sending...")
-            self._log_message("TX", TX_MSG_COLOR, address, name, message)
+            self._log_message("TX", address, message)
             self.n_pages_tx += 1
             self._refresh_panels()
             self.transceiver.send(address, function, message, bitrate=self.bitrate,
@@ -816,6 +884,12 @@ class PocsagTUI(App):
         save_address_book(self.address_book)
         self._log(f"Saved {addr} as {name!r} (edit addresses.json to rename).")
         self._refresh_panels()
+
+    def action_toggle_own_filter(self):
+        self.hide_own_messages = not self.hide_own_messages
+        self._render_messages()
+        self._refresh_panels()
+        self._log(f"MESSAGES: own-sent messages {'hidden' if self.hide_own_messages else 'shown'}.")
 
     def action_help(self):
         self.push_screen(HelpModal())

@@ -192,6 +192,7 @@ either way.
 | `r` | Toggle RX on/off |
 | `s` | Settings (TX/RX gain, bitrate, address filter, our address) |
 | `c` | Save the last-seen address to the address book |
+| `o` | Hide/show messages we sent ourselves, in MESSAGES |
 | `h` / `?` | Help |
 | `q` | Quit (closes the device cleanly) |
 
@@ -201,13 +202,24 @@ the reference image this was built against. Panels: FREQUENCY/MODE,
 RADIO SETTINGS, STATUS (RIG/RX/LOCK/CLIPPING/counts), SPECTRUM SCOPE,
 WATERFALL, MEMORY (address book), MESSAGES, ACTIVITY LOG.
 
-MESSAGES is a decluttered, color-coded RX/TX log -- just address, saved
-nickname (if any), and message text, blue for received and red for
-transmitted (`RX_MSG_COLOR`/`TX_MSG_COLOR` in `pocsag_tui.py`) -- kept
-deliberately separate from ACTIVITY LOG, which still gets its own fuller
+MESSAGES is a decluttered, structured RX/TX log -- kept deliberately
+separate from ACTIVITY LOG, which still gets its own fuller technical
 line for the same event (gain/bitrate changes, batch sync acquired/lost,
 codeword-decode failures, etc.) alongside everything else it already
-logged. A codeword BCH can't correct (`pocsag.py`'s `bch_decode` returns
+logs. Each entry shows explicit `To:`/`From:` fields (address, plus a
+saved nickname or `(you)` if it's our own capcode) followed by the
+message text, color-coded by priority (`RX_MSG_COLOR`/`OWN_MSG_COLOR`/
+`TO_US_MSG_COLOR` in `pocsag_tui.py`): gray for anything we transmitted
+ourselves (`From: US` -- POCSAG/GSC pages carry no real sender field, so
+"from us" is only ever knowable for what this station itself sent; a
+received page's actual origin is unknowable from the protocol, shown as
+`From: RF`), yellow for a received page addressed to our own capcode
+(Settings' "Our address"), blue otherwise. `o` hides/shows our own
+messages -- retroactively, not just for new ones, since the whole panel
+is rebuilt from `PocsagTUI.messages` (a kept, unfiltered history) rather
+than appended to directly; the session log file always gets every
+message regardless of this filter, since filtering is a display-only
+concern. A codeword BCH can't correct (`pocsag.py`'s `bch_decode` returns
 `None`) now surfaces there too as `decode FAILED: codeword 0x... (...)`
 instead of being silently dropped -- wired through `LiveParser`'s
 `on_error` hook in `transceiver.py`'s `_run()`. (Deliberately not raised
