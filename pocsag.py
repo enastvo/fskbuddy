@@ -345,8 +345,8 @@ class LiveParser:
     on_error(raw, errs), if given, fires for a codeword BCH couldn't
     correct (errs 2 or -1, see bch_decode's docstring) -- feed()'s return
     value itself stays Page-or-None either way (unchanged, so existing
-    callers -- pocsag_rx.py, pocsag_test_ota.py, pocsag_test_loopback.py --
-    don't need to change) with the bad codeword just silently dropped as
+    callers -- pocsag_test_ota.py, pocsag_test_loopback.py -- don't need
+    to change) with the bad codeword just silently dropped as
     before unless a caller opts in to on_error. Deliberately NOT fired for
     an address with no message words before the next address (that's
     normal for a spec-compliant tone-only/ring-only page, not a decode

@@ -8,7 +8,7 @@ Two independent MultiUSRP sessions, one per board (identified by serial --
 see SERIALS below, or override via argv). TX runs in its own thread against
 its own device; RX polling happens in the main thread against the other
 device -- each device only ever sees the one thread it actually needs, so
-the documented 2-thread-max-per-device contract (pocsag_modem.py's module
+the documented 2-thread-max-per-device contract (modem.py's module
 docstring) is satisfied independently on each board, not shared across them
 (they're different USB devices entirely).
 
@@ -30,9 +30,10 @@ import numpy as np
 import uhd
 
 import gsc as g
-from pocsag_modem import open_usrp, modulate_cpfsk, REG_GSC_CTRL, RB_GSC_STATUS, list_devices
+from modem import open_usrp, modulate_cpfsk, REG_GSC_CTRL, RB_GSC_STATUS, list_devices
+from transceiver import DEFAULT_FREQ, TWO_RADIO_TX_GAIN, TWO_RADIO_RX_GAIN
 
-FREQ = 929.6625e6
+FREQ = DEFAULT_FREQ
 RATE = 1e6
 GSC_BITRATE = 600  # GSC's fixed baud rate, see gsc.py's module docstring / transceiver.py
 ADDRESS = 765432
@@ -40,11 +41,12 @@ FUNCTION = 3
 MESSAGE = "HELLO GSC WORLD 123"
 DURATION_S = 20.0
 
-TX_GAIN = 50.0  # matches pocsag_tui.py's TUI_DEFAULT_TX_GAIN -- calibrated for a real
-                 # two-separate-boards link budget (found the hard way: pocsag_test_ota.py's
-                 # own 15dB/35dB is same-board TRX->RX2 leakage, near-zero path loss, way too
-                 # weak for real antenna-to-antenna distance)
-RX_GAIN = 65.0  # matches pocsag_tui.py's TUI_DEFAULT_RX_GAIN, see above
+# TWO_RADIO_TX_GAIN/RX_GAIN (see transceiver.py) -- calibrated for a real two-separate-
+# boards link budget (found the hard way: pocsag_test_ota.py's own same-board defaults
+# are near-zero-path-loss TRX->RX2 leakage, way too weak for real antenna-to-antenna
+# distance), not redeclared as a separate literal here.
+TX_GAIN = TWO_RADIO_TX_GAIN
+RX_GAIN = TWO_RADIO_RX_GAIN
 TEST_DEVIATION_HZ = 25000.0  # see module docstring -- swamps this board's DC-offset artifact,
                               # same fix pocsag_test_ota.py already validated on the same PHY
 

@@ -4,9 +4,9 @@ board. This is pocsag_test_loopback.py's twin with the digital loopback
 register removed -- signal goes through the actual DUC/DAC/mixer/antenna/
 mixer/ADC/DDC path this time, same as the FLEX over-the-air test earlier.
 
-One process, not pocsag_tx.py + pocsag_rx.py separately -- only one process
-can hold the device open at a time, and this needs TX and RX live
-concurrently anyway for the framer to have something to lock onto.
+One process -- only one process can hold the device open at a time, and
+this needs TX and RX live concurrently anyway for the framer to have
+something to lock onto.
 
 Adjust TX_GAIN / RX_GAIN below (or edit to add argparse) -- the script
 prints the hardware's actual valid gain range on startup.
@@ -17,7 +17,8 @@ import numpy as np
 import uhd
 
 import pocsag as p
-from pocsag_modem import open_usrp, modulate_cpfsk, REG_POCSAG_CTRL, RB_POCSAG_STATUS
+from modem import open_usrp, modulate_cpfsk, REG_POCSAG_CTRL, RB_POCSAG_STATUS
+from transceiver import DEFAULT_FREQ, DEFAULT_TX_GAIN, DEFAULT_RX_GAIN
 
 # fsk_demod.v's discriminator has no DC/CFO correction -- it's a bare
 # sign-of-instantaneous-frequency slicer around 0Hz. This board's RX front
@@ -32,7 +33,7 @@ from pocsag_modem import open_usrp, modulate_cpfsk, REG_POCSAG_CTRL, RB_POCSAG_S
 # RF; it trades away compatibility with a real commercial pager's exact
 # deviation, which was never the goal of this test anyway.
 
-FREQ = 929.6625e6
+FREQ = DEFAULT_FREQ
 RATE = 1e6
 BITRATE = 1200
 ADDRESS = 1234567
@@ -40,8 +41,8 @@ FUNCTION = 3
 MESSAGE = "the quick brown fox jumps over the lazy dog 0123456789"
 DURATION_S = 20.0
 
-TX_GAIN = 15.0
-RX_GAIN = 35.0
+TX_GAIN = DEFAULT_TX_GAIN  # tuned for this same-board loopback-through-air link
+RX_GAIN = DEFAULT_RX_GAIN  # specifically -- see transceiver.py's own comment
 TEST_DEVIATION_HZ = 25000.0  # standard 4500Hz still fully fails on this board -- see
                               # module docstring re: the ~3.4kHz LO-leakage DC-offset
                               # artifact this RX front end has (comparable in size to

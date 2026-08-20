@@ -8,7 +8,7 @@ instead of POCSAG's.
 
 Continuously transmits a known GSC message (looped, so there's always fresh
 preamble+blocks flowing) while draining RX and polling the new PHY
-registers -- both from this same (main) thread; see pocsag_modem's module
+registers -- both from this same (main) thread; see modem's module
 docstring for why RX draining and register polling can't be split across
 their own separate threads on this device.
 
@@ -30,9 +30,11 @@ import numpy as np
 import uhd
 
 import gsc as g
-from pocsag_modem import open_usrp, modulate_cpfsk, REG_GSC_CTRL, RB_GSC_STATUS
+from modem import open_usrp, modulate_cpfsk, REG_GSC_CTRL, RB_GSC_STATUS
+from transceiver import DEFAULT_FREQ
 
-FREQ = 929.6625e6
+FREQ = DEFAULT_FREQ  # not redeclared as a literal -- see transceiver.py, the one place
+                      # this project's default operating frequency is actually defined
 RATE = 1e6
 BITRATE = 600  # GSC's fixed baud rate -- see gsc.py/gsc_framer.v, not user-configurable
 ADDRESS = 765432  # < 2^21, see gsc.py's encode_address bounds check

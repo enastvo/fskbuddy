@@ -7,6 +7,16 @@ Screen {
     color: #33ff33;
 }
 
+#brand {
+    height: 1;
+    width: 100%;
+    background: black;
+    color: #ff2299;
+    text-style: bold;
+    content-align: left middle;
+    padding: 0 1;
+}
+
 #topbar {
     height: 1;
     width: 100%;

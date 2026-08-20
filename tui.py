@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""POCSAG Transceiver TUI -- styled after a retro green-phosphor radio
+"""FSK Buddy TUI -- styled after a retro green-phosphor radio
 control terminal (see the reference image this was modeled on: boxed,
 titled panels; a live clock; a function-key-style footer). Built with
 Textual, the closest thing Python has to ratatui (reactive widgets,
 CSS-like styling, a widget tree instead of hand-rolled curses drawing).
 
 Runs the shared PocsagTransceiver (see transceiver.py) -- the same classes
-the headless CLI (`pocsag_ctl.py send`/`listen`) uses -- so the TUI is a
+the headless CLI (`fskbuddy.py send`/`listen`) uses -- so the TUI is a
 thin presentation layer over the same TX/RX machinery, not a separate
 implementation.
 """
@@ -27,7 +27,7 @@ from textual.widgets import Footer, Input, Label, RichLog, Static
 import pocsag as p
 from transceiver import (
     PocsagTransceiver, PocsagReceiver, DEFAULT_FREQ, DEFAULT_RATE,
-    DEFAULT_BITRATE, DEFAULT_DEVIATION_HZ,
+    DEFAULT_BITRATE, DEFAULT_DEVIATION_HZ, TWO_RADIO_TX_GAIN, TWO_RADIO_RX_GAIN,
 )
 
 ADDRESS_BOOK_PATH = Path(__file__).parent / "addresses.json"
@@ -35,23 +35,13 @@ STATION_PATH = Path(__file__).parent / "station.json"
 LOGS_DIR = Path(__file__).parent / "logs"
 BITRATES = [512, 1200, 2400]
 
-# TUI-specific gain defaults. Used to be pinned to the B200mini's hardware
-# ceilings (TX 89.75dB, RX 76dB) on the theory that there's no single sane
-# default across setups so it should start hot and let the user dial down.
-# That theory didn't survive contact with a real two-radio link: an
-# empirical gain sweep between two boards on a bench (see the two-board
-# troubleshooting session) found max gain badly overdrives the RX front
-# end at typical close range -- CLIPPING, no LOCK, nothing decodes -- while
-# 50/65 TX/RX locked and decoded cleanly with no clipping. Still just a
-# starting point (dial in Settings, `s`, for your actual antenna distance/
-# link budget), but one that's been shown to actually work on real
-# hardware rather than one guaranteed to saturate the receiver. Deliberately
-# NOT the same as transceiver.py's DEFAULT_TX_GAIN/DEFAULT_RX_GAIN (15/35),
-# which the CLI send/listen subcommands still use and which are tuned for
-# a same-board loopback link, a much shorter/stronger path than two
-# separate radios over the air.
-TUI_DEFAULT_TX_GAIN = 50.0
-TUI_DEFAULT_RX_GAIN = 65.0
+# The TUI starts up assuming a real two-board link (see
+# transceiver.py's TWO_RADIO_TX_GAIN/TWO_RADIO_RX_GAIN for the
+# calibration writeup) rather than transceiver.py's own
+# DEFAULT_TX_GAIN/DEFAULT_RX_GAIN, which are tuned for the CLI's
+# send/listen subcommands against a same-board loopback link instead.
+TUI_DEFAULT_TX_GAIN = TWO_RADIO_TX_GAIN
+TUI_DEFAULT_RX_GAIN = TWO_RADIO_RX_GAIN
 
 # Waterfall history: one row every WATERFALL_INTERVAL_S, WATERFALL_MAX_LINES
 # kept -- a 10-minute horizon. The live spectrum bars above still refresh at
@@ -387,7 +377,7 @@ class HelpModal(ModalScreen):
         panel.border_title = "HELP"
         with panel:
             yield Static(
-                "POCSAG TRANSCEIVER\n\n"
+                "FSK BUDDY\n\n"
                 "t   transmit a page\n"
                 "r   toggle RX on/off\n"
                 "s   settings (frequency, gains, bitrate, address filter, our address --\n"
@@ -416,8 +406,8 @@ class HelpModal(ModalScreen):
 # Main app
 
 class PocsagTUI(App):
-    CSS_PATH = "pocsag_tui.css"
-    TITLE = "POCSAG TRANSCEIVER"
+    CSS_PATH = "tui.css"
+    TITLE = "FSK BUDDY"
     BINDINGS = [
         Binding("t", "transmit", "Transmit"),
         Binding("r", "toggle_rx", "Toggle RX"),
@@ -480,7 +470,7 @@ class PocsagTUI(App):
         self._log_file = None
         try:
             LOGS_DIR.mkdir(exist_ok=True)
-            log_path = LOGS_DIR / f"pocsag_{datetime.datetime.now():%Y%m%d_%H%M%S}.log"
+            log_path = LOGS_DIR / f"fskbuddy_{datetime.datetime.now():%Y%m%d_%H%M%S}.log"
             self._log_file = open(log_path, "a", buffering=1)  # line-buffered
             self.log_file_path = log_path
         except Exception:
@@ -488,6 +478,7 @@ class PocsagTUI(App):
 
     # -- layout ---------------------------------------------------------
     def compose(self) -> ComposeResult:
+        yield Static(self._brand_text(), id="brand")
         yield Static(self._topbar_text(), id="topbar")
         with Horizontal(id="row1"):
             freq_panel = Vertical(id="freq-panel", classes="panel")
@@ -597,10 +588,21 @@ class PocsagTUI(App):
             self.action_toggle_rx()
 
     # -- periodic / helpers -----------------------------------------------
+    def _brand_text(self):
+        """Big, bold wordmark, top-left -- fullwidth Unicode letters (the
+        same double-width-per-character convention Japanese game/anime
+        title screens use for Latin text -- "impact" lettering) plus a
+        pair of "彡" motion-line flourishes, a real manga/anime typesetting
+        convention for emphasis. Deliberately not ASCII block-art: that
+        needs a fixed character grid to stay aligned and breaks the moment
+        a terminal's font or width differs even slightly, where a single
+        styled line degrades gracefully instead."""
+        return "★彡 ＦＳＫ ＢＵＤＤＹ 彡★"
+
     def _topbar_text(self):
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         link = "CONNECTED" if self.rig_online else "CONNECTING"
-        return f"POCSAG TRANSCEIVER        {now}        LINK: {link}"
+        return f"{now}        LINK: {link}"
 
     def _tick_clock(self):
         try:

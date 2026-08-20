@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""POCSAG pager transceiver: combined TUI + CLI controller, built on the
-PocsagTransceiver/PocsagReceiver/PocsagTransmitter classes in
-transceiver.py (the same classes the TUI uses, so `send`/`listen` here are
-not a separate implementation -- just a headless front end onto the same
-machinery).
+"""FSK Buddy: a POCSAG + GSC pager transceiver for the USRP B200mini.
+Combined TUI + CLI controller, built on the PocsagTransceiver/
+PocsagReceiver/PocsagTransmitter classes in transceiver.py (the same
+classes the TUI uses, so `send`/`listen` here are not a separate
+implementation -- just a headless front end onto the same machinery).
 
 `send`/`listen` never stream raw IQ over USB at all -- decode runs
 entirely off FPGA register polling (see README's "USB streaming"
@@ -18,12 +18,12 @@ licensed to transmit on. That's the operator's responsibility every time
 TX is used; see the README's "Licensing" section before changing it.
 
 Usage:
-  python3 pocsag_ctl.py                                    # TUI (default)
-  python3 pocsag_ctl.py tui
-  python3 pocsag_ctl.py tui --no-spectrum --no-waterfall    # headless-equivalent TUI,
-                                                             # no USB IQ streaming
-  python3 pocsag_ctl.py send --address 1234567 --alpha "hi there"
-  python3 pocsag_ctl.py listen --duration 30 --address 1234567
+  python3 fskbuddy.py                                   # TUI (default)
+  python3 fskbuddy.py tui
+  python3 fskbuddy.py tui --no-spectrum --no-waterfall   # headless-equivalent TUI,
+                                                          # no USB IQ streaming
+  python3 fskbuddy.py send --address 1234567 --alpha "hi there"
+  python3 fskbuddy.py listen --duration 30 --address 1234567
 """
 import argparse
 import sys
@@ -36,10 +36,10 @@ from transceiver import (
 
 
 def cmd_tui(args):
-    from pocsag_tui import PocsagTUI
+    from tui import PocsagTUI
     # tx_gain/rx_gain default to None here (see build_parser) so, unless the
     # user explicitly passes --tx-gain/--rx-gain, PocsagTUI's own defaults
-    # apply (see TUI_DEFAULT_TX_GAIN/RX_GAIN in pocsag_tui.py) instead of
+    # apply (see TUI_DEFAULT_TX_GAIN/RX_GAIN in tui.py) instead of
     # duplicating that number here.
     kwargs = dict(freq=args.freq, rate=args.rate, bitrate=args.bitrate,
                   deviation_hz=args.deviation, autostart_rx=not args.no_rx,
@@ -104,7 +104,7 @@ def add_common_args(sp):
 
 
 def build_parser():
-    ap = argparse.ArgumentParser(prog="pocsag_ctl.py", description=__doc__,
+    ap = argparse.ArgumentParser(prog="fskbuddy.py", description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
 
@@ -112,10 +112,10 @@ def build_parser():
     add_common_args(tui_p)
     tui_p.add_argument("--tx-gain", type=float, default=None,
                         help="TX gain (dB); defaults to the TUI's own starting point "
-                             "(see TUI_DEFAULT_TX_GAIN in pocsag_tui.py) if not given")
+                             "(see TUI_DEFAULT_TX_GAIN in tui.py) if not given")
     tui_p.add_argument("--rx-gain", type=float, default=None,
                         help="RX gain (dB); defaults to the TUI's own starting point "
-                             "(see TUI_DEFAULT_RX_GAIN in pocsag_tui.py) if not given")
+                             "(see TUI_DEFAULT_RX_GAIN in tui.py) if not given")
     tui_p.add_argument("--no-rx", action="store_true", help="don't auto-start RX on launch")
     tui_p.add_argument("--no-spectrum", action="store_true",
                         help="hide the spectrum scope panel. Combined with --no-waterfall, "
@@ -183,7 +183,7 @@ def main():
     # tui/send/listen -- auto-picks if there's only one, prompts (numbered
     # list) if there's more than one connected, unless --serial was already
     # given explicitly.
-    from pocsag_modem import select_device_interactive
+    from modem import select_device_interactive
     args.serial = select_device_interactive(args.serial)
 
     args.func(args)

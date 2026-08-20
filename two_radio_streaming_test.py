@@ -4,7 +4,7 @@ radio_legacy.v's run_rx_fabric / PocsagReceiver.start()'s
 `self._streaming = self.on_spectrum is not None` gate) end-to-end, over
 real RF between two genuinely separate B200minis -- one board's
 PocsagTransceiver transmits, the other's PocsagReceiver (started with NO
-on_spectrum, matching every headless use case: pocsag_ctl.py listen/send,
+on_spectrum, matching every headless use case: fskbuddy.py listen/send,
 a TUI with both panels hidden) receives.
 
 Unlike gsc_test_ota_2radio.py / pocsag_test_ota.py (which manage
@@ -16,17 +16,16 @@ sniffing the USB bus -- see the module's own start()/_run() gating) and
 prints the receiver's own internal _streaming flag as direct evidence.
 """
 import sys
-import threading
 import time
 
-sys.path.insert(0, "/home/user/lab/fpga_test/pocsag")
-from pocsag_modem import open_usrp, list_devices
-from transceiver import PocsagReceiver, PocsagTransmitter, GSC_BITRATE
+from modem import open_usrp, list_devices
+from transceiver import (PocsagReceiver, PocsagTransmitter, GSC_BITRATE, DEFAULT_FREQ,
+                          TWO_RADIO_TX_GAIN, TWO_RADIO_RX_GAIN)
 
-FREQ = 929.6625e6
+FREQ = DEFAULT_FREQ
 RATE = 1e6
-TX_GAIN = 50.0
-RX_GAIN = 65.0
+TX_GAIN = TWO_RADIO_TX_GAIN
+RX_GAIN = TWO_RADIO_RX_GAIN
 ADDRESS = 765432
 FUNCTION = 3
 MESSAGE = "HELLO GSC WORLD 123"
@@ -48,7 +47,7 @@ def run_one_protocol(protocol, tx_usrp, tx_streamer, rx_usrp, rx_regs, rx_stream
     receiver = PocsagReceiver(rx_usrp, rx_regs, rx_streamer, protocol=protocol,
                                on_page=on_page, on_log=on_log)
     # Deliberately NOT passing on_spectrum -- this is the exact condition
-    # every headless caller (pocsag_ctl.py listen/send, a TUI with both
+    # every headless caller (fskbuddy.py listen/send, a TUI with both
     # panels hidden) already uses. start() should skip stream_cmd/recv()
     # entirely in this mode.
     receiver.start()

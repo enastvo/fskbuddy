@@ -170,7 +170,7 @@ def build_word_pair_bits(word1_cw23, word2_cw23):
     """Comma + Word 1 (46 symbols) + half-bit gap (1 symbol) + Word 2 (46
     symbols) -- all at one uniform symbol rate now (see module docstring),
     so this is a plain bit list suitable for the same kind of per-bit sps
-    modulation pocsag_modem.py's modulate_cpfsk already does. No special
+    modulation modem.py's modulate_cpfsk already does. No special
     fractional-duration handling needed."""
     w1 = _codeword_symbols(word1_cw23)
     w2 = _codeword_symbols(word2_cw23)

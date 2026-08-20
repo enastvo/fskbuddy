@@ -1,25 +1,92 @@
-# POCSAG pager transceiver
+# FSK Buddy
 
-A POCSAG pager transmitter/receiver for the USRP B200mini, built on a
-custom FPGA image (see `../uhd/fpga/usrp3/lib/radio_200/pocsag_*.v` and
-`fsk_demod.v`) that does bit synchronization, batch/frame synchronization,
-and channel filtering in hardware, plus a Python/Textual TUI and CLI on
-top.
+A POCSAG + GSC pager transmitter/receiver for the USRP B200mini. Real-time
+bit sync, batch/frame sync, and channel filtering run in a custom FPGA
+image, decode/FEC and message assembly run in Python, and a Textual TUI
+(or a plain CLI) sits on top -- listen for pages on air, or send your own.
 
-## Licensing -- transmit responsibly
+**Only transmit on a frequency you're actually licensed to use.** This
+tool has no way to know what you're authorized for -- see "Licensing"
+near the bottom before you hit TX.
 
-**Frequency (`--freq`, or the Settings screen's "Frequency" field, `s`) is
-fully configurable, and the hardware will transmit on whatever you set it
-to.** This software has no way to know what you're actually authorized to
-transmit on -- it doesn't check band plans, doesn't check your license
-class, doesn't stop you from keying up somewhere you shouldn't. That's on
-you, the operator, every time. Receiving is generally unrestricted;
-*transmitting* is what requires real authorization (an amateur radio
-license for ham bands, a commercial/private-land-mobile license
-elsewhere, etc.) -- know what band you're tuned to and what it actually
-authorizes before you hit TX. `DEFAULT_FREQ` (929.6625MHz, in
-`transceiver.py`) was this project's original private-paging-band test
-frequency; it is not a recommendation for your own use.
+## Quick start
+
+### Setup
+
+The TUI needs `textual`, which needs installing into a venv (the system
+Python is externally-managed / Debian-policy-locked). The venv must see
+the system-installed `uhd` Python bindings, hence `--system-site-packages`:
+
+```
+python3 -m venv --system-site-packages .venv
+.venv/bin/pip install textual
+```
+
+(`fskbuddy.py send`/`listen` and the plain test scripts only need `numpy`
++ `uhd`, already available system-wide -- the venv is only required for
+the `tui` subcommand.)
+
+### Running it
+
+```
+.venv/bin/python3 fskbuddy.py                 # TUI (default)
+.venv/bin/python3 fskbuddy.py tui --no-rx      # TUI, don't auto-start RX
+.venv/bin/python3 fskbuddy.py tui --no-spectrum --no-waterfall  # hide both panels *and*
+                                                                 # stop streaming raw IQ
+                                                                 # over USB (see below)
+
+python3 fskbuddy.py send --address 1234567 --alpha "hello world"
+python3 fskbuddy.py send --address 1234568 --numeric "18005551234"
+python3 fskbuddy.py send --address 1234567 --alpha "hi there" --protocol gsc
+python3 fskbuddy.py listen --duration 30 --address 1234567
+```
+
+`--freq`, `--rate`, `--bitrate` (512/1200/2400), `--deviation`, `--protocol`
+(`pocsag`/`gsc`) are available on all three subcommands; TX/RX gain flags
+differ slightly by subcommand (see `--help`).
+
+`send`/`listen` never stream raw IQ over USB in the first place -- decode
+runs entirely off FPGA register polling. `tui` does the same whenever
+*both* `--no-spectrum` and `--no-waterfall` are given. See "USB
+streaming" below for the full writeup.
+
+### Multiple boards
+
+If more than one B200mini is plugged in, all three subcommands prompt for
+which one to use (a numbered list):
+
+```
+2 B200mini devices found:
+  [1] serial=3103D0D  product=B200mini
+  [2] serial=3103D16  product=B200mini
+Select device [1-2]:
+```
+
+Pass `--serial <serial>` to skip the prompt (scriptable/non-interactive
+use); with only one board connected it's picked automatically, no prompt
+either way.
+
+### TUI keys
+
+| Key | Action |
+|---|---|
+| `t` | Transmit (compose: address or saved nickname, type, message) |
+| `r` | Toggle RX on/off |
+| `s` | Settings (frequency, TX/RX gain, bitrate, address filter, our address) |
+| `c` | Save the last-seen address to the address book |
+| `o` | Hide/show messages we sent ourselves, in MESSAGES |
+| `h` / `?` | Help |
+| `q` | Quit (closes the device cleanly) |
+
+Layout: FREQUENCY/MODE, RADIO SETTINGS, STATUS, SPECTRUM SCOPE,
+WATERFALL, MEMORY (address book), MESSAGES, ACTIVITY LOG. See "The TUI
+panels, in detail" below for what each one actually shows and why.
+
+---
+
+Everything past this point is implementation detail most people won't
+need -- how it's built, what's been verified and how, and the caveats
+that came out of actually testing this on real hardware.
 
 ## Architecture
 
@@ -49,7 +116,7 @@ frequency; it is not a recommendation for your own use.
   32-bit codewords, re-verifies sync every batch.
 - Reachable via `USER_SETTINGS`: `poke32(3*4, {enable,sps})` to configure,
   `peek64(2*8)` to poll for freshly-captured codewords (see
-  `pocsag_modem.py`'s `REG_POCSAG_CTRL`/`RB_POCSAG_STATUS`).
+  `modem.py`'s `REG_POCSAG_CTRL`/`RB_POCSAG_STATUS`).
 - `gsc_framer.v` -- GSC (Golay Sequential Code)'s equivalent of
   `pocsag_framer.v`, a second bit-timing-recovery (a second
   `pocsag_bitsync.v` instance, reused as-is at GSC's own 600-baud sps) +
@@ -60,7 +127,7 @@ frequency; it is not a recommendation for your own use.
   than POCSAG's fixed-batch-length resync (see its header for why: this
   project's own GSC TX convention puts a full comma before every block).
   Reachable via `poke32(4*4, {enable,sps})` / `peek64(3*8)` (see
-  `pocsag_modem.py`'s `REG_GSC_CTRL`/`RB_GSC_STATUS`). See "GSC support"
+  `modem.py`'s `REG_GSC_CTRL`/`RB_GSC_STATUS`). See "GSC support"
   below for the full caveats on what this protocol implementation is (and
   isn't) validated against.
 - All of the above tap `ddc_chain`'s `sample_rx`/`strobe_rx`, gated by a
@@ -86,7 +153,7 @@ frequency; it is not a recommendation for your own use.
   (`gsc.py`, with a `LiveParser` mirroring `pocsag.py`'s). See "GSC
   support" below for what's confirmed-real vs. this project's own
   convention.
-- `pocsag_modem.py` -- shared UHD plumbing (`open_usrp`, `modulate_cpfsk`,
+- `modem.py` -- shared UHD plumbing (`open_usrp`, `modulate_cpfsk`,
   the USER_SETTINGS register addresses). Read its module docstring before
   touching threading here -- **three threads concurrently doing USB I/O
   against this device deadlocks it** (confirmed with a minimal repro: not
@@ -96,14 +163,14 @@ frequency; it is not a recommendation for your own use.
 - `transceiver.py` -- `PocsagReceiver`, `PocsagTransmitter`,
   `PocsagTransceiver` classes wrapping the above into a reusable API. This
   is what both the TUI and the CLI (`send`/`listen`) are built on -- not a
-  separate implementation for each front end.
-- `pocsag_tui.py` / `pocsag_tui.css` -- the interactive TUI (Textual).
-- `pocsag_ctl.py` -- combined entry point: `tui` (default), `send`,
+  separate implementation for each front end. Also where the shared
+  operating defaults actually live (`DEFAULT_FREQ`, `DEFAULT_TX_GAIN`/
+  `DEFAULT_RX_GAIN` for a same-board link, `TWO_RADIO_TX_GAIN`/
+  `TWO_RADIO_RX_GAIN` for a real two-board link) -- other scripts import
+  these rather than redeclaring their own copies of the same numbers.
+- `tui.py` / `tui.css` -- the interactive TUI (Textual).
+- `fskbuddy.py` -- combined entry point: `tui` (default), `send`,
   `listen` subcommands.
-- `pocsag_tx.py` / `pocsag_rx.py` -- older standalone scripts (pre-date
-  `transceiver.py`); still work, but `pocsag_ctl.py send`/`listen` are the
-  same functionality built on the shared classes and are the ones being
-  maintained going forward.
 - `pocsag_test_loopback.py` / `pocsag_test_ota.py` -- validation scripts
   (internal digital loopback and real same-board over-the-air, respectively).
 - `gsc_test_loopback.py` / `gsc_test_ota_2radio.py` -- GSC's equivalents:
@@ -119,88 +186,13 @@ frequency; it is not a recommendation for your own use.
 - `addresses.json` -- capcode -> nickname address book, used by the TUI.
 - `station.json` -- this station's own capcode (Settings -> "Our address"),
   purely identifying/informational; see the promiscuous-receive note below.
-- `logs/` -- one plain-text file per TUI session (`pocsag_YYYYMMDD_HHMMSS.log`,
+- `logs/` -- one plain-text file per TUI session (`fskbuddy_YYYYMMDD_HHMMSS.log`,
   created on launch, path also announced in ACTIVITY LOG), mirroring both
   ACTIVITY LOG and MESSAGES -- neither panel is otherwise persisted
   anywhere, so this is what there is to go back and review after a run
   ends. Not rotated/pruned automatically; delete old ones by hand.
 
-## Setup
-
-The TUI needs `textual`, which needs installing into a venv (the system
-Python is externally-managed / Debian-policy-locked). The venv must see
-the system-installed `uhd` Python bindings, hence `--system-site-packages`:
-
-```
-python3 -m venv --system-site-packages .venv
-.venv/bin/pip install textual
-```
-
-(`pocsag_ctl.py send`/`listen` and the plain scripts only need `numpy` +
-`uhd`, already available system-wide -- the venv is only required for the
-`tui` subcommand.)
-
-## Usage
-
-```
-.venv/bin/python3 pocsag_ctl.py                 # TUI (default)
-.venv/bin/python3 pocsag_ctl.py tui --no-rx      # TUI, don't auto-start RX
-.venv/bin/python3 pocsag_ctl.py tui --no-spectrum --no-waterfall  # hide both panels *and*
-                                                                   # stop streaming raw IQ
-                                                                   # over USB (see below)
-
-python3 pocsag_ctl.py send --address 1234567 --alpha "hello world"
-python3 pocsag_ctl.py send --address 1234568 --numeric "18005551234"
-python3 pocsag_ctl.py listen --duration 30 --address 1234567
-```
-
-`--freq`, `--rate`, `--bitrate` (512/1200/2400), `--deviation` are
-available on all three subcommands; TX/RX gain flags differ slightly by
-subcommand (see `--help`).
-
-`send`/`listen` never stream raw IQ over USB in the first place -- decode
-runs entirely off FPGA register polling (`peek64`), same as `tui` does
-whenever *both* `--no-spectrum` and `--no-waterfall` are given (there's no
-raw-sample use left once both panels are hidden -- see "USB streaming"
-below for the full writeup and the real bandwidth numbers). Give either
-panel alone and streaming stays on as usual, since the display needs real
-sample content.
-
-### Multiple boards
-
-If more than one B200mini is plugged in, all three subcommands prompt for
-which one to use (a numbered list, `uhd.find()` under the hood -- the same
-discovery `uhd_find_devices` uses, just returned as data instead of
-printed):
-
-```
-2 B200mini devices found:
-  [1] serial=3103D0D  product=B200mini
-  [2] serial=3103D16  product=B200mini
-Select device [1-2]:
-```
-
-Pass `--serial <serial>` to skip the prompt (scriptable/non-interactive
-use); with only one board connected it's picked automatically, no prompt
-either way.
-
-### TUI keys
-
-| Key | Action |
-|---|---|
-| `t` | Transmit (compose: address or saved nickname, type, message) |
-| `r` | Toggle RX on/off |
-| `s` | Settings (TX/RX gain, bitrate, address filter, our address) |
-| `c` | Save the last-seen address to the address book |
-| `o` | Hide/show messages we sent ourselves, in MESSAGES |
-| `h` / `?` | Help |
-| `q` | Quit (closes the device cleanly) |
-
-Layout is modeled on a retro green-phosphor radio control terminal
-(titled, bordered panels; live clock; function-key-style footer) -- see
-the reference image this was built against. Panels: FREQUENCY/MODE,
-RADIO SETTINGS, STATUS (RIG/RX/LOCK/CLIPPING/counts), SPECTRUM SCOPE,
-WATERFALL, MEMORY (address book), MESSAGES, ACTIVITY LOG.
+## The TUI panels, in detail
 
 MESSAGES is a decluttered, structured RX/TX log -- kept deliberately
 separate from ACTIVITY LOG, which still gets its own fuller technical
@@ -209,7 +201,7 @@ codeword-decode failures, etc.) alongside everything else it already
 logs. Each entry shows explicit `To:`/`From:` fields (address, plus a
 saved nickname or `(you)` if it's our own capcode) followed by the
 message text, color-coded by priority (`RX_MSG_COLOR`/`OWN_MSG_COLOR`/
-`TO_US_MSG_COLOR` in `pocsag_tui.py`): gray for anything we transmitted
+`TO_US_MSG_COLOR` in `tui.py`): gray for anything we transmitted
 ourselves (`From: US` -- POCSAG/GSC pages carry no real sender field, so
 "from us" is only ever knowable for what this station itself sent; a
 received page's actual origin is unknowable from the protocol, shown as
@@ -257,14 +249,14 @@ capcode for reference -- purely identifying, not a filter; it doesn't
 change what's received or displayed.
 
 SPECTRUM SCOPE and
-WATERFALL can each be hidden with `--no-spectrum`/`--no-waterfall` (see
-Usage above); when both are given the underlying FFT is skipped entirely,
-not just the panels hidden -- see `PocsagReceiver.on_spectrum` in
-`transceiver.py`, which is left `None` (rather than a no-op callback) in
-that case so `_run()`'s `if ... is not None` check bypasses the FFT call
-altogether. Going further than the FFT: with both hidden,
-`PocsagReceiver` doesn't stream raw IQ over USB at all in that mode
-either -- see "USB streaming" below.
+WATERFALL can each be hidden with `--no-spectrum`/`--no-waterfall`; when
+both are given the underlying FFT is skipped entirely, not just the
+panels hidden -- see `PocsagReceiver.on_spectrum` in `transceiver.py`,
+which is left `None` (rather than a no-op callback) in that case so
+`_run()`'s `if ... is not None` check bypasses the FFT call altogether.
+Going further than the FFT: with both hidden, `PocsagReceiver` doesn't
+stream raw IQ over USB at all in that mode either -- see "USB streaming"
+below.
 
 The spectrum scope and waterfall are computed live from real RX samples
 (a throttled FFT inside the existing RX thread -- no extra device I/O, no
@@ -285,7 +277,7 @@ not the rest of the UI's green theme), scaled against a slowly-adapting
 floor/ceiling so a real signal shows as a bright band against a stable
 background instead of every row always spanning the full color range. It
 updates on its own, much slower cadence than the live bars
-(`WATERFALL_INTERVAL_S` in `pocsag_tui.py`, derived from
+(`WATERFALL_INTERVAL_S` in `tui.py`, derived from
 `WATERFALL_MAX_LINES=200` for a 10-minute horizon -- ~3s between rows) so
 that horizon doesn't scroll out of view in under a minute.
 
@@ -315,21 +307,21 @@ peak-hold diagnostic register, since removed, compared fabric's raw
 I^2+Q^2 against the host's own peak during deliberate extreme overdrive) --
 confirmed to within 1 LSB of the intended 95%-of-full-scale trip point, not
 just assumed correct from datasheet math. One caveat found while building
-this: at
-*extreme* overdrive (e.g. both TX and RX pinned near max on a short/strong
-link) the receiver can stop returning usable samples almost entirely, and
-in that specific regime the CLIPPING flag may not light up either -- but
-`LOCK: no` / `Codewords: 0` persisting indefinitely is already an
-unambiguous sign something's wrong even then. This is exactly what an
-empirical two-board gain sweep found on real hardware: `TUI_DEFAULT_TX_GAIN`/
-`TUI_DEFAULT_RX_GAIN` (`pocsag_tui.py`) used to be pinned to the B200mini's
-hardware ceilings (TX 89.75dB, RX 76dB) on the theory that there's no
-single sane default across setups -- but at typical close range between
-two separate radios, that combo reliably saturated the receiver
-(CLIPPING, no LOCK, nothing decodes). The defaults are now 50dB TX/65dB
-RX, the combo that sweep found actually locks and decodes cleanly; still
-just a starting point to dial in for your own antenna distance/link
-budget, not a guarantee for every setup.
+this: at *extreme* overdrive (e.g. both TX and RX pinned near max on a
+short/strong link) the receiver can stop returning usable samples almost
+entirely, and in that specific regime the CLIPPING flag may not light up
+either -- but `LOCK: no` / `Codewords: 0` persisting indefinitely is
+already an unambiguous sign something's wrong even then. This is exactly
+what an empirical two-board gain sweep found on real hardware: the TUI's
+gain defaults (`TWO_RADIO_TX_GAIN`/`TWO_RADIO_RX_GAIN` in
+`transceiver.py`) used to be pinned to the B200mini's hardware ceilings
+(TX 89.75dB, RX 76dB) on the theory that there's no single sane default
+across setups -- but at typical close range between two separate radios,
+that combo reliably saturated the receiver (CLIPPING, no LOCK, nothing
+decodes). The defaults are now 50dB TX/65dB RX, the combo that sweep
+found actually locks and decodes cleanly; still just a starting point to
+dial in for your own antenna distance/link budget, not a guarantee for
+every setup.
 
 **Channel** (12.5kHz "narrow" vs 25kHz "wide") in the FREQUENCY/MODE panel
 auto-detects the RX channel width in FPGA fabric (`channel_width_detect.v`),
@@ -352,8 +344,7 @@ consecutive ~4ms windows (~33ms) before latching a classification change,
 same "commit only after sustained agreement" pattern `pocsag_bitsync.v`
 already established. Purely informational for now -- it doesn't yet
 change filter/deviation handling (the channel filter is still one fixed
-~20kHz-cutoff design); see the project's plan notes for the follow-on work
-that would act on it.
+~20kHz-cutoff design).
 
 ## GSC support
 
@@ -416,34 +407,33 @@ antenna-to-antenna link budget, not near-zero same-board leakage) and the
 same larger-than-spec deviation trick (25kHz, swamps this board's
 ~3.4kHz DC-offset artifact) `pocsag_test_ota.py` already validated on the
 identical shared PHY (channel filter, discriminator) GSC's own framer sits
-downstream of. One real,
-characterized edge case turned up along the way and is worth knowing
-about: if a transmission's trailing control word is immediately followed
-by another transmission's own fresh preamble with *zero* gap (concatenating
-repeat bursts bit-for-bit, the way POCSAG's `repeat=` does safely), the
-comma-based resync can transiently mistake preamble content for a comma+
-word pair -- both are alternating patterns. This is always safe (Golay's
-error threshold on the host side rejects the resulting garbage, never
-producing a corrupted page) and self-healing (a fresh correlation search
-re-finds the next real control word within tens of symbols), but can
-briefly cost throughput right at that boundary -- confirmed empirically:
-zero-gap back-to-back repeats occasionally dropped a repeat's page outright
-(safely, not corrupted -- just missing), a real gap between them didn't.
-Fixed on the TX side rather than by making the framer's resync more
-elaborate: `PocsagTransmitter.send()` inserts a real ~100ms RF-silence gap
-between GSC repeats (`GSC_INTER_REPEAT_GAP_S`, `transceiver.py`) instead of
-concatenating them; confirmed clean (2/2 repeats decoded, zero spurious
-errors) with the default `repeat=2` afterward. POCSAG doesn't need this --
-its framer resyncs via a direct 32-bit sync-word correlation, immune to
-"this looks alternating" confusion, so its own repeats stay concatenated
-with no gap.
+downstream of. One real, characterized edge case turned up along the way
+and is worth knowing about: if a transmission's trailing control word is
+immediately followed by another transmission's own fresh preamble with
+*zero* gap (concatenating repeat bursts bit-for-bit, the way POCSAG's
+`repeat=` does safely), the comma-based resync can transiently mistake
+preamble content for a comma+word pair -- both are alternating patterns.
+This is always safe (Golay's error threshold on the host side rejects the
+resulting garbage, never producing a corrupted page) and self-healing (a
+fresh correlation search re-finds the next real control word within tens
+of symbols), but can briefly cost throughput right at that boundary --
+confirmed empirically: zero-gap back-to-back repeats occasionally dropped
+a repeat's page outright (safely, not corrupted -- just missing), a real
+gap between them didn't. Fixed on the TX side rather than by making the
+framer's resync more elaborate: `PocsagTransmitter.send()` inserts a real
+~100ms RF-silence gap between GSC repeats (`GSC_INTER_REPEAT_GAP_S`,
+`transceiver.py`) instead of concatenating them; confirmed clean (2/2
+repeats decoded, zero spurious errors) with the default `repeat=2`
+afterward. POCSAG doesn't need this -- its framer resyncs via a direct
+32-bit sync-word correlation, immune to "this looks alternating"
+confusion, so its own repeats stay concatenated with no gap.
 
 ## USB streaming
 
 `PocsagReceiver` skips streaming raw IQ over USB entirely when nothing
 needs the sample content -- i.e. whenever `on_spectrum` isn't given
-(`pocsag_ctl.py listen`/`send`, or the TUI with both the spectrum and
-waterfall panels hidden, since `pocsag_tui.py` already funnels both into
+(`fskbuddy.py listen`/`send`, or the TUI with both the spectrum and
+waterfall panels hidden, since `tui.py` already funnels both into
 one `on_spectrum` callback: `want_spectrum = self.show_spectrum or
 self.show_waterfall`). Before this, `start()`/`_run()` issued
 `stream_cmd(start_cont)` and called `rx_streamer.recv()` unconditionally,
@@ -553,3 +543,18 @@ against a newer GCC/Boost/CPython than it's typically tested with), not a
 device or logic problem: `uhd_find_devices` confirms the board is healthy
 immediately after every occurrence. Treat a nonzero exit code alongside
 expected output/log lines as a pass, not a failure.
+
+## Licensing -- transmit responsibly
+
+**Frequency (`--freq`, or the Settings screen's "Frequency" field, `s`) is
+fully configurable, and the hardware will transmit on whatever you set it
+to.** This software has no way to know what you're actually authorized to
+transmit on -- it doesn't check band plans, doesn't check your license
+class, doesn't stop you from keying up somewhere you shouldn't. That's on
+you, the operator, every time. Receiving is generally unrestricted;
+*transmitting* is what requires real authorization (an amateur radio
+license for ham bands, a commercial/private-land-mobile license
+elsewhere, etc.) -- know what band you're tuned to and what it actually
+authorizes before you hit TX. `DEFAULT_FREQ` (929.6625MHz, in
+`transceiver.py`) was this project's original private-paging-band test
+frequency; it is not a recommendation for your own use.

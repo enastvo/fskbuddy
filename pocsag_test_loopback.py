@@ -6,7 +6,7 @@ doesn't decode cleanly, the problem is in the FPGA, not the antenna setup.
 
 Continuously transmits a known POCSAG message (looped, so there's always
 fresh preamble+batches flowing) while draining RX and polling the new PHY
-registers -- both from this same (main) thread; see pocsag_modem's module
+registers -- both from this same (main) thread; see modem's module
 docstring for why RX draining and register polling can't be split across
 their own separate threads on this device.
 """
@@ -16,9 +16,11 @@ import numpy as np
 import uhd
 
 import pocsag as p
-from pocsag_modem import open_usrp, modulate_cpfsk, REG_POCSAG_CTRL, RB_POCSAG_STATUS
+from modem import open_usrp, modulate_cpfsk, REG_POCSAG_CTRL, RB_POCSAG_STATUS
+from transceiver import DEFAULT_FREQ
 
-FREQ = 929.6625e6
+FREQ = DEFAULT_FREQ  # not redeclared as a literal -- see transceiver.py, the one place
+                      # this project's default operating frequency is actually defined
 RATE = 1e6
 BITRATE = 1200
 ADDRESS = 1234567  # frame_number=7 -> message spans multiple batches

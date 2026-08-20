@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Reusable POCSAG transmitter/receiver classes, sitting on top of the FPGA
-PHY (pocsag_bitsync.v + pocsag_framer.v + the existing fsk_demod/duc/ddc
-chains) the same way pocsag_tx.py/pocsag_rx.py/pocsag_test_ota.py do.
+"""Reusable POCSAG/GSC transmitter/receiver classes, sitting on top of the
+FPGA PHY (pocsag_bitsync.v/gsc_framer.v + the existing fsk_demod/duc/ddc
+chains) the same way pocsag_test_ota.py does.
 
 One physical device, one MultiUSRP session (PocsagTransceiver owns it) --
-pocsag_tx.py and pocsag_rx.py were separate processes that couldn't run
-concurrently against the same board; these classes are meant to be driven
-together by one controller (see pocsag_ctl.py).
+these classes are meant to be driven together by one controller (see
+fskbuddy.py).
 
-Threading contract (load-bearing, see pocsag_modem.py's docstring for the
+Threading contract (load-bearing, see modem.py's docstring for the
 underlying discovery): this device deadlocks with three threads
 concurrently doing USB I/O against it. So:
   - PocsagReceiver owns exactly one thread, which does recv() AND
@@ -29,14 +28,32 @@ import uhd
 
 import pocsag as p
 import gsc
-from pocsag_modem import (open_usrp, modulate_cpfsk, REG_POCSAG_CTRL, RB_POCSAG_STATUS,
-                           REG_GSC_CTRL, RB_GSC_STATUS, RB_PHY_STATUS)
+from modem import (open_usrp, modulate_cpfsk, REG_POCSAG_CTRL, RB_POCSAG_STATUS,
+                   REG_GSC_CTRL, RB_GSC_STATUS, RB_PHY_STATUS)
 
 DEFAULT_FREQ = 929.6625e6
 DEFAULT_RATE = 1e6
-DEFAULT_TX_GAIN = 15.0
-DEFAULT_RX_GAIN = 35.0
+DEFAULT_TX_GAIN = 15.0  # tuned for a same-board loopback link (a much shorter/stronger
+DEFAULT_RX_GAIN = 35.0  # path than two separate radios over the air) -- see TWO_RADIO_*
+                         # below for the real two-board defaults; the CLI's send/listen
+                         # subcommands use these since fskbuddy.py's send/listen are
+                         # commonly run against a single board's own loopback/OTA path.
 DEFAULT_BITRATE = 1200
+
+# Real two-board defaults -- used to be pinned to the B200mini's hardware
+# ceilings (TX 89.75dB, RX 76dB) on the theory that there's no single sane
+# default across setups so it should start hot and let the user dial down.
+# That theory didn't survive contact with a real two-radio link: an
+# empirical gain sweep between two boards on a bench found max gain badly
+# overdrives the RX front end at typical close range -- CLIPPING, no LOCK,
+# nothing decodes -- while 50/65 TX/RX locked and decoded cleanly with no
+# clipping. Still just a starting point (dial in via Settings, `s`, in the
+# TUI, for your actual antenna distance/link budget), but one that's been
+# shown to actually work on real hardware rather than one guaranteed to
+# saturate the receiver. Deliberately NOT the same as DEFAULT_TX_GAIN/
+# DEFAULT_RX_GAIN above -- see there.
+TWO_RADIO_TX_GAIN = 50.0
+TWO_RADIO_RX_GAIN = 65.0
 GSC_BITRATE = 600  # GSC's fixed baud rate (a real spec value, see gsc.py's module
                     # docstring) -- unlike POCSAG's bitrate, this isn't user-configurable,
                     # so it's a plain module constant rather than a request_bitrate() knob.
@@ -177,7 +194,7 @@ class PocsagReceiver:
         # near-zero (occasional peek64/poke32 only) -- see the plan notes
         # for the full writeup. `self.on_spectrum is not None` is already
         # the exact "do I need raw IQ" signal (see __init__ and
-        # pocsag_tui.py's own want_spectrum = show_spectrum or
+        # tui.py's own want_spectrum = show_spectrum or
         # show_waterfall, which is what sets it).
         self._streaming = self.on_spectrum is not None
         if self._streaming:
@@ -303,7 +320,7 @@ class PocsagReceiver:
                 self._safe_callback(self.on_spectrum, mags, self.usrp.get_rx_rate())
 
             # Status layout differs per protocol -- see RB_POCSAG_STATUS/
-            # RB_GSC_STATUS's comments in pocsag_modem.py -- but both boil
+            # RB_GSC_STATUS's comments in modem.py -- but both boil
             # down to the same (locked, free-running block count,
             # raw-codeword payload) shape this loop already diffs/decodes
             # generically below.

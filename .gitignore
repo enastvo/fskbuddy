@@ -2,3 +2,10 @@
 __pycache__/
 *.pyc
 logs/
+
+# Planning notes, spec references, and Claude-Code-session artifacts --
+# useful locally, never meant to be committed. Anything placed under
+# docs/ is excluded wholesale rather than picking files one at a time.
+docs/
+CLAUDE.md
+.claude/
