@@ -466,6 +466,19 @@ doesn't just add latency, it silently loses codewords/blocks. Fixed by
 polling every 2ms instead (cheap -- `peek64` is a register read, not a USB
 bulk transfer).
 
+**On the actual USB traffic number**: "zero streaming" is verified directly
+(`rx_streamer.recv()` is provably never called in this mode -- see above),
+but "how many bytes/sec that leaves" is an estimate, not a bus-level
+measurement -- this environment doesn't have `usbmon` access (needs `sudo`,
+unavailable non-interactively here) to capture and confirm one. At up to
+~500-1000 tiny `peek64` register-read transactions/sec (2ms poll x 2 reads/
+iteration) over UHD's small control-packet channel -- not the bulk
+sample-streaming endpoint an RX packet uses -- even a generous per-
+transaction estimate bounds this well under 2Mbps, versus the ~32Mbps
+continuous stream this mode replaces. That's a >95% cut, confidently, but
+don't take "under 2Mbps" as a precise measured figure -- it's a bound, not
+a capture.
+
 ## POCSAG spec compliance
 
 Core framing matches spec and is validated end-to-end on real hardware:
