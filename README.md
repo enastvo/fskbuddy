@@ -6,6 +6,21 @@ custom FPGA image (see `../uhd/fpga/usrp3/lib/radio_200/pocsag_*.v` and
 and channel filtering in hardware, plus a Python/Textual TUI and CLI on
 top.
 
+## Licensing -- transmit responsibly
+
+**Frequency (`--freq`, or the Settings screen's "Frequency" field, `s`) is
+fully configurable, and the hardware will transmit on whatever you set it
+to.** This software has no way to know what you're actually authorized to
+transmit on -- it doesn't check band plans, doesn't check your license
+class, doesn't stop you from keying up somewhere you shouldn't. That's on
+you, the operator, every time. Receiving is generally unrestricted;
+*transmitting* is what requires real authorization (an amateur radio
+license for ham bands, a commercial/private-land-mobile license
+elsewhere, etc.) -- know what band you're tuned to and what it actually
+authorizes before you hit TX. `DEFAULT_FREQ` (929.6625MHz, in
+`transceiver.py`) was this project's original private-paging-band test
+frequency; it is not a recommendation for your own use.
+
 ## Architecture
 
 **FPGA (real-time PHY, in fabric):**

@@ -296,18 +296,21 @@ class TransmitModal(ModalScreen):
 class SettingsModal(ModalScreen):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self, tx_gain, rx_gain, bitrate, address_filter, own_address):
+    def __init__(self, tx_gain, rx_gain, bitrate, address_filter, own_address, freq):
         super().__init__()
         self.init_tx_gain = tx_gain
         self.init_rx_gain = rx_gain
         self.init_bitrate = bitrate
         self.init_filter = address_filter
         self.init_own_address = own_address
+        self.init_freq = freq
 
     def compose(self) -> ComposeResult:
         panel = Vertical(id="settings-modal")
         panel.border_title = "RADIO SETTINGS"
         with panel:
+            yield Label("Frequency (MHz) -- only transmit where you're licensed to:")
+            yield Input(value=f"{self.init_freq/1e6:.4f}", id="s-freq")
             yield Label("TX gain (dB, 0-89.75):")
             yield Input(value=str(self.init_tx_gain), id="s-txgain")
             yield Label("RX gain (dB, 0-76):")
@@ -332,6 +335,7 @@ class SettingsModal(ModalScreen):
             return
         err = self.query_one("#s-error", Label)
         try:
+            freq = float(self.query_one("#s-freq", Input).value) * 1e6
             tx_gain = float(self.query_one("#s-txgain", Input).value)
             rx_gain = float(self.query_one("#s-rxgain", Input).value)
             bitrate = int(self.query_one("#s-bitrate", Input).value)
@@ -340,15 +344,22 @@ class SettingsModal(ModalScreen):
             own_raw = self.query_one("#s-ownaddr", Input).value.strip()
             own_address = int(own_raw) if own_raw else None
         except ValueError:
-            err.update("TX gain, RX gain, bitrate, address filter, our address must be numbers")
+            err.update("Frequency, TX gain, RX gain, bitrate, address filter, our address "
+                       "must be numbers")
             return
         if bitrate not in BITRATES:
             err.update(f"Bitrate must be one of {BITRATES}")
             return
+        # B200mini's RF front end range (Ettus spec) -- a sanity bound, not
+        # a substitute for actually knowing what you're licensed to
+        # transmit on (see this field's own label, and the README).
+        if not (70e6 <= freq <= 6e9):
+            err.update("Frequency must be 70-6000 MHz (B200mini RF range)")
+            return
         if own_address is not None and not (0 <= own_address < (1 << 21)):
             err.update("Our address must be 0..2097151 (21-bit capcode)")
             return
-        self.dismiss((tx_gain, rx_gain, bitrate, address_filter, own_address))
+        self.dismiss((freq, tx_gain, rx_gain, bitrate, address_filter, own_address))
 
 
 class HelpModal(ModalScreen):
@@ -362,7 +373,8 @@ class HelpModal(ModalScreen):
                 "POCSAG TRANSCEIVER\n\n"
                 "t   transmit a page\n"
                 "r   toggle RX on/off\n"
-                "s   settings (gains, bitrate, address filter, our address)\n"
+                "s   settings (frequency, gains, bitrate, address filter, our address --\n"
+                "    only transmit on a frequency you're actually licensed to use)\n"
                 "c   add current/last-seen address to address book\n"
                 "h/? this help\n"
                 "q   quit\n\n"
@@ -766,7 +778,9 @@ class PocsagTUI(App):
         def handle_result(result):
             if result is None:
                 return
-            tx_gain, rx_gain, bitrate, address_filter, own_address = result
+            freq, tx_gain, rx_gain, bitrate, address_filter, own_address = result
+            freq_changed = (freq != self.freq)
+            self.freq = freq
             self.tx_gain = tx_gain
             self.rx_gain = rx_gain
             self.bitrate = bitrate
@@ -775,18 +789,20 @@ class PocsagTUI(App):
                 self.own_address = own_address
                 save_station(own_address)
             if self.transceiver is not None:
+                if freq_changed:
+                    self.transceiver.request_freq(freq)
                 self.transceiver.transmitter.tx_gain = tx_gain
                 self.transceiver.receiver.request_gain(rx_gain)
                 self.transceiver.receiver.request_bitrate(bitrate)
                 self.transceiver.receiver.set_address_filter(address_filter)
-            self._log(f"Settings updated: TX={tx_gain}dB RX={rx_gain}dB "
-                       f"bitrate={bitrate}bps filter={address_filter} "
+            self._log(f"Settings updated: freq={freq/1e6:.4f}MHz TX={tx_gain}dB "
+                       f"RX={rx_gain}dB bitrate={bitrate}bps filter={address_filter} "
                        f"our_address={own_address}")
             self._refresh_panels()
 
         self.push_screen(
             SettingsModal(self.tx_gain, self.rx_gain, self.bitrate, self.address_filter,
-                          self.own_address),
+                          self.own_address, self.freq),
             handle_result,
         )
 

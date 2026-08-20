@@ -110,6 +110,7 @@ class PocsagReceiver:
         self._stop_event = threading.Event()
         self._pending_rx_gain = None
         self._pending_bitrate = None
+        self._pending_freq = None
         self._lock = threading.Lock()
         self._streaming = False  # set in start(), read in stop() -- whether this session
                                   # actually issued stream_cmd(start_cont) (only when
@@ -136,6 +137,14 @@ class PocsagReceiver:
     def request_bitrate(self, bitrate):
         with self._lock:
             self._pending_bitrate = bitrate
+
+    def request_freq(self, freq):
+        # Same pattern as request_gain/request_bitrate -- applied from
+        # this receiver's own thread in _run() below, not here directly,
+        # per the module docstring's threading contract (retuning is USB
+        # I/O against the shared usrp, same as set_rx_gain already is).
+        with self._lock:
+            self._pending_freq = freq
 
     def set_address_filter(self, address):
         self.address_filter = address
@@ -242,9 +251,15 @@ class PocsagReceiver:
             with self._lock:
                 pending_gain, self._pending_rx_gain = self._pending_rx_gain, None
                 pending_bitrate, self._pending_bitrate = self._pending_bitrate, None
+                pending_freq, self._pending_freq = self._pending_freq, None
             if pending_gain is not None:
                 self.usrp.set_rx_gain(pending_gain)
                 self._safe_callback(self.on_log, f"RX gain -> {pending_gain} dB")
+            if pending_freq is not None:
+                self.usrp.set_rx_freq(uhd.types.TuneRequest(pending_freq))
+                actual = self.usrp.get_rx_freq()
+                self._safe_callback(self.on_log,
+                                     f"RX freq -> {actual/1e6:.4f} MHz (requested {pending_freq/1e6:.4f})")
             if pending_bitrate is not None:
                 if self.protocol == "pocsag":
                     self.bitrate = pending_bitrate
@@ -411,11 +426,18 @@ class PocsagTransmitter:
                          # burst (rather than relying on the caller to resend) is cheap
                          # and meaningfully more reliable in practice.
 
-    def __init__(self, usrp, tx_streamer, tx_gain=DEFAULT_TX_GAIN,
+    def __init__(self, usrp, tx_streamer, tx_gain=DEFAULT_TX_GAIN, freq=DEFAULT_FREQ,
                  deviation_hz=DEFAULT_DEVIATION_HZ, on_log=None):
         self.usrp = usrp
         self.tx_streamer = tx_streamer
         self.tx_gain = tx_gain
+        self.freq = freq  # re-tuned fresh on every send() below, same pattern as tx_gain --
+                           # a caller (PocsagTransceiver.request_freq(), the TUI's Settings)
+                           # just sets this attribute directly; there's no dedicated TX
+                           # thread to hand it to ahead of time the way PocsagReceiver's
+                           # request_gain/request_freq need one (send() already runs in its
+                           # own thread per call, so retuning there is already the right
+                           # thread per the module docstring's contract).
         self.deviation_hz = deviation_hz
         self.on_log = on_log or (lambda msg: None)
         self._send_lock = threading.Lock()
@@ -432,6 +454,7 @@ class PocsagTransmitter:
         with self._send_lock:
             g = gain if gain is not None else self.tx_gain
             self.usrp.set_tx_gain(g)
+            self.usrp.set_tx_freq(uhd.types.TuneRequest(self.freq))
 
             if protocol == "pocsag":
                 msg_cws = p.encode_alpha(message) if function == 3 else p.encode_numeric(message)
@@ -472,8 +495,10 @@ class PocsagTransmitter:
                     iq = np.concatenate([iq, gap_iq, burst_iq])
                 n_bits = len(bits) * max(1, repeat)
 
-            self.on_log(f"TX[{protocol}] addr={address} func={function} {n_bits} bits "
-                        f"({repeat}x) @ {use_bitrate}bps, {g} dB: {message!r}")
+            actual_freq = self.usrp.get_tx_freq()
+            self.on_log(f"TX[{protocol}] {actual_freq/1e6:.4f}MHz addr={address} "
+                        f"func={function} {n_bits} bits ({repeat}x) @ {use_bitrate}bps, "
+                        f"{g} dB: {message!r}")
 
             md = uhd.types.TXMetadata()
             md.start_of_burst = True
@@ -536,8 +561,31 @@ class PocsagTransceiver:
         self.receiver = PocsagReceiver(self.usrp, self.regs, self.rx_streamer,
                                         bitrate=bitrate, protocol=protocol, on_log=self.on_log)
         self.transmitter = PocsagTransmitter(self.usrp, self.tx_streamer,
-                                              tx_gain=tx_gain, deviation_hz=deviation_hz,
+                                              tx_gain=tx_gain, freq=freq,
+                                              deviation_hz=deviation_hz,
                                               on_log=self.on_log)
+
+    def request_freq(self, freq):
+        """Re-tune both RX and TX to a new shared frequency -- see
+        transceiver.py's design note: this project deliberately keeps one
+        shared frequency (not independent RX/TX) rather than a
+        repeater-style split, matching how every part of this project
+        already operates. TX picks the new value up fresh on its next
+        send() (see PocsagTransmitter.send()); RX is applied from its own
+        thread if currently running (see PocsagReceiver.request_freq()),
+        or directly here if not (no RX thread active to hand it to, and
+        no thread-safety concern retuning directly in that case).
+
+        Operating outside a frequency band you're licensed for is the
+        caller's responsibility -- this library has no way to know what
+        you're actually authorized to transmit on. See the README's
+        licensing note."""
+        self.freq = freq
+        self.transmitter.freq = freq
+        if self.receiver.running:
+            self.receiver.request_freq(freq)
+        else:
+            self.usrp.set_rx_freq(uhd.types.TuneRequest(freq))
 
     # -- convenience passthroughs -------------------------------------
     def start_rx(self, on_page=None, on_status=None, on_spectrum=None):

@@ -12,6 +12,11 @@ section). `tui` gets the same behavior automatically whenever BOTH
 once both panels are hidden); with either one shown, streaming stays on
 as usual, since the spectrum/waterfall display needs real sample content.
 
+--freq is fully configurable and the hardware will transmit on whatever
+you set it to -- this tool has no way to know what you're actually
+licensed to transmit on. That's the operator's responsibility every time
+TX is used; see the README's "Licensing" section before changing it.
+
 Usage:
   python3 pocsag_ctl.py                                    # TUI (default)
   python3 pocsag_ctl.py tui
@@ -84,7 +89,9 @@ def cmd_listen(args):
 
 
 def add_common_args(sp):
-    sp.add_argument("--freq", type=float, default=DEFAULT_FREQ, help="center frequency (Hz)")
+    sp.add_argument("--freq", type=float, default=DEFAULT_FREQ,
+                     help="center frequency (Hz) -- only transmit where you're licensed to; "
+                          "see the README's Licensing section")
     sp.add_argument("--rate", type=float, default=DEFAULT_RATE, help="host sample rate (Hz)")
     sp.add_argument("--bitrate", type=int, default=DEFAULT_BITRATE, choices=[512, 1200, 2400])
     sp.add_argument("--deviation", type=float, default=DEFAULT_DEVIATION_HZ,
