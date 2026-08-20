@@ -130,7 +130,9 @@ python3 -m venv --system-site-packages .venv
 ```
 .venv/bin/python3 pocsag_ctl.py                 # TUI (default)
 .venv/bin/python3 pocsag_ctl.py tui --no-rx      # TUI, don't auto-start RX
-.venv/bin/python3 pocsag_ctl.py tui --no-spectrum --no-waterfall  # hide/skip both panels
+.venv/bin/python3 pocsag_ctl.py tui --no-spectrum --no-waterfall  # hide both panels *and*
+                                                                   # stop streaming raw IQ
+                                                                   # over USB (see below)
 
 python3 pocsag_ctl.py send --address 1234567 --alpha "hello world"
 python3 pocsag_ctl.py send --address 1234568 --numeric "18005551234"
@@ -140,6 +142,14 @@ python3 pocsag_ctl.py listen --duration 30 --address 1234567
 `--freq`, `--rate`, `--bitrate` (512/1200/2400), `--deviation` are
 available on all three subcommands; TX/RX gain flags differ slightly by
 subcommand (see `--help`).
+
+`send`/`listen` never stream raw IQ over USB in the first place -- decode
+runs entirely off FPGA register polling (`peek64`), same as `tui` does
+whenever *both* `--no-spectrum` and `--no-waterfall` are given (there's no
+raw-sample use left once both panels are hidden -- see "USB streaming"
+below for the full writeup and the real bandwidth numbers). Give either
+panel alone and streaming stays on as usual, since the display needs real
+sample content.
 
 ### Multiple boards
 
@@ -225,7 +235,9 @@ Usage above); when both are given the underlying FFT is skipped entirely,
 not just the panels hidden -- see `PocsagReceiver.on_spectrum` in
 `transceiver.py`, which is left `None` (rather than a no-op callback) in
 that case so `_run()`'s `if ... is not None` check bypasses the FFT call
-altogether.
+altogether. Going further than the FFT: with both hidden,
+`PocsagReceiver` doesn't stream raw IQ over USB at all in that mode
+either -- see "USB streaming" below.
 
 The spectrum scope and waterfall are computed live from real RX samples
 (a throttled FFT inside the existing RX thread -- no extra device I/O, no

@@ -5,9 +5,18 @@ transceiver.py (the same classes the TUI uses, so `send`/`listen` here are
 not a separate implementation -- just a headless front end onto the same
 machinery).
 
+`send`/`listen` never stream raw IQ over USB at all -- decode runs
+entirely off FPGA register polling (see README's "USB streaming"
+section). `tui` gets the same behavior automatically whenever BOTH
+--no-spectrum and --no-waterfall are given (there's no raw-sample use left
+once both panels are hidden); with either one shown, streaming stays on
+as usual, since the spectrum/waterfall display needs real sample content.
+
 Usage:
   python3 pocsag_ctl.py                                    # TUI (default)
   python3 pocsag_ctl.py tui
+  python3 pocsag_ctl.py tui --no-spectrum --no-waterfall    # headless-equivalent TUI,
+                                                             # no USB IQ streaming
   python3 pocsag_ctl.py send --address 1234567 --alpha "hi there"
   python3 pocsag_ctl.py listen --duration 30 --address 1234567
 """
@@ -102,12 +111,22 @@ def build_parser():
                              "(see TUI_DEFAULT_RX_GAIN in pocsag_tui.py) if not given")
     tui_p.add_argument("--no-rx", action="store_true", help="don't auto-start RX on launch")
     tui_p.add_argument("--no-spectrum", action="store_true",
-                        help="hide the spectrum scope panel")
+                        help="hide the spectrum scope panel. Combined with --no-waterfall, "
+                             "also stops streaming raw IQ over USB entirely (decode keeps "
+                             "working via FPGA register polling alone) -- see README's "
+                             "'USB streaming' section")
     tui_p.add_argument("--no-waterfall", action="store_true",
-                        help="hide the waterfall panel")
+                        help="hide the waterfall panel. Combined with --no-spectrum, "
+                             "also stops streaming raw IQ over USB entirely -- see above")
     # Note: the underlying FFT (PocsagReceiver._run()) only runs at all if
     # at least one of the two panels is enabled -- passing both flags skips
-    # it entirely rather than just hiding empty panels.
+    # it entirely rather than just hiding empty panels. As of the
+    # run_rx_fabric fix (radio_legacy.v) this also means PocsagReceiver
+    # skips stream_cmd/recv() entirely in that case (self._streaming =
+    # False) -- decode still works, purely off USER_SETTINGS register
+    # polling, just without the USB bandwidth cost of a continuous raw IQ
+    # stream. send/listen already get this for free -- they never pass
+    # on_spectrum at all.
     tui_p.set_defaults(func=cmd_tui)
 
     send_p = sub.add_parser("send", help="transmit one page and exit")
