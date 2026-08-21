@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Estefan Nastvogel
+# SPDX-License-Identifier: GPL-3.0-or-later
 """FSK Buddy: a POCSAG + GSC pager transceiver for the USRP B200mini.
 Combined TUI + CLI controller, built on the PocsagTransceiver/
 PocsagReceiver/PocsagTransmitter classes in transceiver.py (the same

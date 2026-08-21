@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Estefan Nastvogel
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Validates the FPGA GSC PHY (gsc_bitsync + gsc_framer.v) over the internal
 digital TX->RX loopback register, before trying real RF. Mirrors
 pocsag_test_loopback.py exactly (same rationale: isolates RTL logic bugs

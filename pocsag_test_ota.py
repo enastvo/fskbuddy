@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Estefan Nastvogel
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Real over-the-air POCSAG test: TX out the TRX port, RX in on RX2, same
 board. This is pocsag_test_loopback.py's twin with the digital loopback
 register removed -- signal goes through the actual DUC/DAC/mixer/antenna/

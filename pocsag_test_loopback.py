@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Estefan Nastvogel
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Validates the FPGA POCSAG PHY (pocsag_bitsync.v + pocsag_framer.v) over
 the internal digital TX->RX loopback register, before trying real RF. This
 isolates RTL logic bugs from RF link-budget/alignment issues -- if this

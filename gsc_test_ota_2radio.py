@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Estefan Nastvogel
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Real two-radio over-the-air GSC test: one B200mini transmits, a SEPARATE
 one receives -- true OTA, not pocsag_test_ota.py's same-board TRX->RX2
 loopback-through-air trick (this one doesn't need that trick since there

@@ -620,3 +620,13 @@ elsewhere, etc.) -- know what band you're tuned to and what it actually
 authorizes before you hit TX. `DEFAULT_FREQ` (929.6625MHz, in
 `transceiver.py`) was this project's original private-paging-band test
 frequency; it is not a recommendation for your own use.
+
+## Software license
+
+Copyright (C) 2026 Estefan Nastvogel.
+
+Licensed under the GNU General Public License v3.0 (GPLv3) or, at your
+option, any later version -- see `LICENSE` for the full text. Not to be
+confused with the RF-transmission "licensing" section above, which is
+about spectrum/regulatory authorization, a completely separate concern
+from this software copyright license.

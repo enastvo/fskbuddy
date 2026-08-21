@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Estefan Nastvogel
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Validates PocsagReceiver's register-poll-only mode (see
 radio_legacy.v's run_rx_fabric / PocsagReceiver.start()'s
 `self._streaming = self.on_spectrum is not None` gate) end-to-end, over

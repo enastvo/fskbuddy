@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Estefan Nastvogel
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 Standard binary Golay(23,12,7) encode/decode -- the forward error
 correction GSC (Golay Sequential Code) paging uses for its control word,

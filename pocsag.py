@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Estefan Nastvogel
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 POCSAG protocol library: BCH(31,21) encode/decode, address/message codeword
 packing, and batch/preamble assembly. This is the link-layer half of the

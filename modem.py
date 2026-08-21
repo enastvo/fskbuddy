@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Estefan Nastvogel
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Shared UHD/RF plumbing for the POCSAG TX and RX programs.
 
 Threading note: this device hangs (not just slows down -- a hard deadlock,

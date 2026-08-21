@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Estefan Nastvogel
+# SPDX-License-Identifier: GPL-3.0-or-later
 """FSK Buddy TUI -- styled after a retro green-phosphor radio
 control terminal (see the reference image this was modeled on: boxed,
 titled panels; a live clock; a function-key-style footer). Built with

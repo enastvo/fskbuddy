@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Estefan Nastvogel
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Reusable POCSAG/GSC transmitter/receiver classes, sitting on top of the
 FPGA PHY (pocsag_bitsync.v/gsc_framer.v + the existing fsk_demod/duc/ddc
 chains) the same way pocsag_test_ota.py does.
