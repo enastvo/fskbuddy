@@ -3,6 +3,15 @@ __pycache__/
 *.pyc
 logs/
 
+# Personal runtime state (this station's own capcode, your saved address
+# book) -- not source, and a fresh clone shouldn't inherit whatever
+# capcodes/nicknames someone else was testing with. Both load_station()/
+# load_address_book() in tui.py already handle these files being absent
+# (empty address book, no own address set) -- they get created fresh on
+# first save from within the TUI.
+addresses.json
+station.json
+
 # Planning notes, spec references, and Claude-Code-session artifacts --
 # useful locally, never meant to be committed. Anything placed under
 # docs/ is excluded wholesale rather than picking files one at a time.

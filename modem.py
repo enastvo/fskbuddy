@@ -10,10 +10,23 @@ recv() interleaved with peek64/poke32 in the main thread/one other
 thread). So RX draining and register polling must always happen from the
 *same* thread here -- see poll_loop() below -- with TX (if any) in its own
 separate thread."""
+import os
+from pathlib import Path
+
 import numpy as np
 import uhd
 
-FPGA_BIN = "/home/user/lab/fpga_test/uhd/fpga/usrp3/top/b2xxmini/build-B200mini/b205.bit"
+# The custom FPGA bitstream (see the sibling uhd/ checkout's own build
+# instructions -- this repo doesn't build it, only consumes the .bit file
+# that comes out). Defaults to the conventional sibling-directory layout
+# this whole project assumes (fskbuddy/ and uhd/ side by side under one
+# parent, e.g. .../fpga_test/{fskbuddy,uhd}) -- computed relative to this
+# file's own location, not a hardcoded absolute path, so it works
+# regardless of where the parent directory actually lives. Override with
+# FSKBUDDY_FPGA_BIN if your layout differs.
+_DEFAULT_FPGA_BIN = (Path(__file__).resolve().parent.parent
+                      / "uhd/fpga/usrp3/top/b2xxmini/build-B200mini/b205.bit")
+FPGA_BIN = os.environ.get("FSKBUDDY_FPGA_BIN", str(_DEFAULT_FPGA_BIN))
 
 # Standard POCSAG deviation.
 DEVIATION_HZ = 4500.0
@@ -83,6 +96,13 @@ def select_device_interactive(serial=None):
 
 
 def open_usrp(freq, rate, gain, antenna, tx=False, serial=None):
+    if not os.path.isfile(FPGA_BIN):
+        raise FileNotFoundError(
+            f"Custom FPGA bitstream not found at {FPGA_BIN!r}. This project needs the "
+            f"sibling uhd/ checkout's own bitstream built first (see its "
+            f"docker/build_fpga.sh) -- expected at .../uhd/fpga/usrp3/top/b2xxmini/"
+            f"build-B200mini/b205.bit relative to fskbuddy/'s own parent directory, or "
+            f"set FSKBUDDY_FPGA_BIN to point at wherever your build actually put it.")
     args = f"type=b200,fpga={FPGA_BIN},enable_user_regs"
     if serial:
         args += f",serial={serial}"

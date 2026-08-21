@@ -44,7 +44,7 @@ def cmd_tui(args):
         print("error: the 'textual' package isn't installed for whichever python3 "
               "just ran this.\n\n"
               "The tui subcommand needs a venv (the system python3 is externally-"
-              "managed and won't have it) -- see README.md's Setup section:\n\n"
+              "managed and won't have it) -- see README.md's Installation section:\n\n"
               "  python3 -m venv --system-site-packages .venv\n"
               "  .venv/bin/pip install textual\n\n"
               "then launch with .venv/bin/python3, not plain python3:\n\n"

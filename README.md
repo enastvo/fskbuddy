@@ -11,20 +11,82 @@ near the bottom before you hit TX.
 
 ## Quick start
 
-### Setup
+### Installation
 
-The TUI needs `textual`, which needs installing into a venv (the system
-Python is externally-managed / Debian-policy-locked). The venv must see
-the system-installed `uhd` Python bindings, hence `--system-site-packages`:
+**1. System dependencies** (Ubuntu/Debian; tested on Ubuntu 26.04):
 
 ```
+sudo apt update
+sudo apt install uhd-host python3-uhd libuhd-dev python3-numpy
+```
+
+This installs the UHD driver, its Python bindings, and numpy, all
+system-wide -- no venv needed for these three. `uhd-host` also installs
+the udev rules needed for non-root USB access to the B200mini; unplug and
+replug the board (or `sudo udevadm control --reload-rules`) if it was
+already connected when you installed.
+
+**2. This repo, plus a sibling FPGA source tree:**
+
+```
+git clone git@github.com:enastvo/fskbuddy.git
+```
+
+FSK Buddy talks to stock UHD APIs (`enable_user_regs`,
+`get_user_settings_iface()`) -- the host-side driver from step 1 doesn't
+need to be custom. What *does* need to be custom is the FPGA bitstream
+itself (see "Architecture" below for exactly which modules are added on
+top of the stock b2xxmini image). This repo expects a sibling `uhd/`
+checkout -- carrying this project's own `radio_200` RTL additions, built
+into a `.bit` file -- living right next to `fskbuddy/` under one parent
+directory (a separate `docker/` sibling holds the Xilinx ISE build
+environment that actually produces that bitstream, see below):
+
+```
+some-parent-dir/
+├── fskbuddy/   (this repo)
+├── uhd/        (the FPGA source tree, with this project's RTL patches, built)
+└── docker/     (the Xilinx ISE 14.7-in-Docker build environment for uhd/'s bitstream)
+```
+
+`modem.py` looks for the built bitstream at
+`uhd/fpga/usrp3/top/b2xxmini/build-B200mini/b205.bit` relative to that
+parent directory by default; set the `FSKBUDDY_FPGA_BIN` environment
+variable to point elsewhere if your layout differs. Building that
+bitstream needs Xilinx ISE 14.7 (a licensed, discontinued Xilinx tool that
+only runs containerized -- see `docker/README.md` for the full one-time
+setup: installing Docker, getting a free Xilinx WebPACK license, building
+the ISE container image, then `docker/build_fpga.sh`) and isn't part of
+*this* repo's own install -- `fskbuddy.py`/the TUI will raise a clear,
+specific error naming the path it expected if the bitstream isn't there
+yet, rather than fail confusingly deep inside UHD.
+
+**3. Python venv, for the TUI only:**
+
+```
+cd fskbuddy
 python3 -m venv --system-site-packages .venv
 .venv/bin/pip install textual
 ```
 
-(`fskbuddy.py send`/`listen` and the plain test scripts only need `numpy`
-+ `uhd`, already available system-wide -- the venv is only required for
-the `tui` subcommand.)
+`--system-site-packages` lets the venv see the system-installed
+`uhd`/`numpy` from step 1 rather than needing its own copies (the system
+Python itself is externally-managed / Debian-policy-locked, hence the
+venv at all). `fskbuddy.py send`/`listen` and the test scripts don't need
+this venv -- they only need `numpy` + `uhd`, already installed system-wide
+in step 1; only the `tui` subcommand needs `textual`.
+
+**Verify the install** (no hardware or FPGA bitstream needed for this part):
+
+```
+python3 -c "import uhd, numpy; print('uhd', uhd.__file__, '/ numpy', numpy.__version__)"
+.venv/bin/python3 fskbuddy.py --help
+python3 fskbuddy.py send --help
+```
+
+If those all print/run cleanly, the Python side of the install is good;
+`fskbuddy.py send`/`listen`/`tui` will still need a real B200mini plugged
+in (and its custom bitstream built, per step 2) to actually do anything.
 
 ### Running it
 
