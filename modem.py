@@ -18,16 +18,13 @@ from pathlib import Path
 import numpy as np
 import uhd
 
-# The custom FPGA bitstream (see the sibling uhd/ checkout's own build
-# instructions -- this repo doesn't build it, only consumes the .bit file
-# that comes out). Defaults to the conventional sibling-directory layout
-# this whole project assumes (fskbuddy/ and uhd/ side by side under one
-# parent, e.g. .../fpga_test/{fskbuddy,uhd}) -- computed relative to this
-# file's own location, not a hardcoded absolute path, so it works
-# regardless of where the parent directory actually lives. Override with
-# FSKBUDDY_FPGA_BIN if your layout differs.
-_DEFAULT_FPGA_BIN = (Path(__file__).resolve().parent.parent
-                      / "uhd/fpga/usrp3/top/b2xxmini/build-B200mini/b205.bit")
+# The custom FPGA bitstream -- see fpga/README.md for what's in that
+# directory and how to rebuild it from source. Ships pre-built right in
+# this repo (fpga/b205.bit, relative to this file's own location, not a
+# hardcoded absolute path) so nothing external is required for the
+# common case. Override with FSKBUDDY_FPGA_BIN to point at a different
+# build (e.g. one you rebuilt yourself elsewhere).
+_DEFAULT_FPGA_BIN = Path(__file__).resolve().parent / "fpga/b205.bit"
 FPGA_BIN = os.environ.get("FSKBUDDY_FPGA_BIN", str(_DEFAULT_FPGA_BIN))
 
 # Standard POCSAG deviation.
@@ -100,11 +97,9 @@ def select_device_interactive(serial=None):
 def open_usrp(freq, rate, gain, antenna, tx=False, serial=None):
     if not os.path.isfile(FPGA_BIN):
         raise FileNotFoundError(
-            f"Custom FPGA bitstream not found at {FPGA_BIN!r}. This project needs the "
-            f"sibling uhd/ checkout's own bitstream built first (see its "
-            f"docker/build_fpga.sh) -- expected at .../uhd/fpga/usrp3/top/b2xxmini/"
-            f"build-B200mini/b205.bit relative to fskbuddy/'s own parent directory, or "
-            f"set FSKBUDDY_FPGA_BIN to point at wherever your build actually put it.")
+            f"Custom FPGA bitstream not found at {FPGA_BIN!r}. It should have shipped "
+            f"at fpga/b205.bit in this repo -- see fpga/README.md. If you moved/rebuilt "
+            f"it elsewhere, set FSKBUDDY_FPGA_BIN to point at wherever it actually is.")
     args = f"type=b200,fpga={FPGA_BIN},enable_user_regs"
     if serial:
         args += f",serial={serial}"

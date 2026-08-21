@@ -26,7 +26,7 @@ the udev rules needed for non-root USB access to the B200mini; unplug and
 replug the board (or `sudo udevadm control --reload-rules`) if it was
 already connected when you installed.
 
-**2. This repo, plus a sibling FPGA source tree:**
+**2. This repo -- the custom FPGA bitstream ships inside it, nothing extra to build:**
 
 ```
 git clone git@github.com:enastvo/fskbuddy.git
@@ -36,30 +36,21 @@ FSK Buddy talks to stock UHD APIs (`enable_user_regs`,
 `get_user_settings_iface()`) -- the host-side driver from step 1 doesn't
 need to be custom. What *does* need to be custom is the FPGA bitstream
 itself (see "Architecture" below for exactly which modules are added on
-top of the stock b2xxmini image). This repo expects a sibling `uhd/`
-checkout -- carrying this project's own `radio_200` RTL additions, built
-into a `.bit` file -- living right next to `fskbuddy/` under one parent
-directory (a separate `docker/` sibling holds the Xilinx ISE build
-environment that actually produces that bitstream, see below):
-
-```
-some-parent-dir/
-├── fskbuddy/   (this repo)
-├── uhd/        (the FPGA source tree, with this project's RTL patches, built)
-└── docker/     (the Xilinx ISE 14.7-in-Docker build environment for uhd/'s bitstream)
-```
-
-`modem.py` looks for the built bitstream at
-`uhd/fpga/usrp3/top/b2xxmini/build-B200mini/b205.bit` relative to that
-parent directory by default; set the `FSKBUDDY_FPGA_BIN` environment
-variable to point elsewhere if your layout differs. Building that
-bitstream needs Xilinx ISE 14.7 (a licensed, discontinued Xilinx tool that
-only runs containerized -- see `docker/README.md` for the full one-time
-setup: installing Docker, getting a free Xilinx WebPACK license, building
-the ISE container image, then `docker/build_fpga.sh`) and isn't part of
-*this* repo's own install -- `fskbuddy.py`/the TUI will raise a clear,
-specific error naming the path it expected if the bitstream isn't there
-yet, rather than fail confusingly deep inside UHD.
+top of the stock b2xxmini image), and a pre-built one ships right in this
+repo at `fpga/b205.bit` -- `modem.py` finds and loads it automatically,
+no separate checkout or build step needed for normal use. See
+`fpga/README.md` for exactly what's in that directory (the bitstream,
+its complete corresponding source as a patch against upstream UHD, and
+the Xilinx ISE build environment used to produce it -- all included
+since GPLv3 requires the corresponding source travel with any binary
+this project distributes) and for optional persistent-flashing
+instructions if you want the device to boot this image without FSK
+Buddy specifying it each time. Building your own from source needs
+Xilinx ISE 14.7 (a licensed, discontinued Xilinx tool that only runs
+containerized) -- see `fpga/docker/README.md` -- and isn't part of *this*
+repo's own install; `fskbuddy.py`/the TUI will raise a clear, specific
+error naming the path it expected if `fpga/b205.bit` is somehow missing,
+rather than fail confusingly deep inside UHD.
 
 **3. Python venv, for the TUI only:**
 
@@ -86,7 +77,8 @@ python3 fskbuddy.py send --help
 
 If those all print/run cleanly, the Python side of the install is good;
 `fskbuddy.py send`/`listen`/`tui` will still need a real B200mini plugged
-in (and its custom bitstream built, per step 2) to actually do anything.
+in to actually do anything (the FPGA bitstream itself is already there,
+shipped in step 2 -- nothing further to build for normal use).
 
 ### Running it
 

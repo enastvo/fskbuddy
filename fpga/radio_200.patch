@@ -1,0 +1,1546 @@
+diff --git a/fpga/usrp3/lib/control/gpio_atr.v b/fpga/usrp3/lib/control/gpio_atr.v
+index f99ac55b1..fe0ae3ba0 100644
+--- a/fpga/usrp3/lib/control/gpio_atr.v
++++ b/fpga/usrp3/lib/control/gpio_atr.v
+@@ -11,7 +11,8 @@ module gpio_atr #(
+   parameter WIDTH         = 32,
+   parameter FAB_CTRL_EN   = 0,
+   parameter DEFAULT_DDR   = 0,
+-  parameter DEFAULT_IDLE  = 0
++  parameter DEFAULT_IDLE  = 0,
++  parameter DEFAULT_FAB_CTRL = 0   // reset value of the per-bit fabric/ATR select mask (only used if FAB_CTRL_EN=1)
+ ) (
+   input clk, input reset,                                       //Clock and reset
+   input set_stb, input [7:0] set_addr, input [31:0] set_data,   //Settings control interface
+@@ -52,7 +53,7 @@ module gpio_atr #(
+     .out(atr_disable),.changed());
+ 
+   generate if (FAB_CTRL_EN == 1) begin
+-    setting_reg #(.my_addr(BASE+6), .width(WIDTH)) reg_fabric_ctrl (
++    setting_reg #(.my_addr(BASE+6), .width(WIDTH), .at_reset(DEFAULT_FAB_CTRL)) reg_fabric_ctrl (
+       .clk(clk),.rst(reset),.strobe(set_stb),.addr(set_addr), .in(set_data),
+       .out(fabric_ctrl),.changed());
+   end else begin
+diff --git a/fpga/usrp3/lib/radio_200/Makefile.srcs b/fpga/usrp3/lib/radio_200/Makefile.srcs
+index 04a28ad95..7b630c355 100644
+--- a/fpga/usrp3/lib/radio_200/Makefile.srcs
++++ b/fpga/usrp3/lib/radio_200/Makefile.srcs
+@@ -10,4 +10,11 @@
+ ##################################################
+ RADIO_200_SRCS = $(abspath $(addprefix $(BASE_DIR)/../lib/radio_200/, \
+ ./radio_legacy.v \
++./fsk_demod.v \
++./pocsag_bitsync.v \
++./pocsag_framer.v \
++./pocsag_channel_filter.v \
++./clip_detect.v \
++./channel_width_detect.v \
++./gsc_framer.v \
+ ))
+diff --git a/fpga/usrp3/lib/radio_200/channel_width_detect.v b/fpga/usrp3/lib/radio_200/channel_width_detect.v
+new file mode 100644
+index 000000000..5c247b00e
+--- /dev/null
++++ b/fpga/usrp3/lib/radio_200/channel_width_detect.v
+@@ -0,0 +1,184 @@
++//
++// channel_width_detect: classifies the RX channel as narrowband
++// (12.5kHz-style, smaller FSK deviation) or wideband (25kHz-style, larger
++// deviation) directly in fabric, by comparing the statistical swing of
++// fsk_demod.v's own discriminator output against the signal's own power --
++// not by running a second bandpass filter pair to measure occupied
++// bandwidth directly (the more literal approach), which would need ~32
++// more DSP48A1 multiplies this design doesn't have spare (112 of 132
++// already used by pocsag_channel_filter.v + fsk_demod.v + clip_detect.v
++// combined). This module adds exactly 2 more (for its own power
++// reference).
++//
++// Math: for small FSK modulation angles (true here -- POCSAG/GSC-scale
++// deviations of a few kHz at a ~1MHz sample rate give phase steps on the
++// order of hundredths of a radian per sample), Im{s[n]*conj(s[n-1])} ~=
++// |s[n]|^2 * sin(dphi) ~= |s[n]|^2 * dphi -- i.e. the raw discriminator
++// value scales with BOTH deviation and instantaneous signal power, so
++// comparing its raw magnitude against a fixed threshold would be
++// confounded by RX gain/link strength (a stronger signal at the SAME
++// deviation would read "wider"). Dividing it out sample-by-sample needs a
++// real divider; instead this accumulates |disc| and power (I^2+Q^2)
++// SEPARATELY over a window and compares abs_disc_sum against SHIFTED (not
++// divided) versions of power_sum -- proportional comparison without a
++// divider, same spirit as pocsag_channel_filter.v's own shift-based
++// unity-gain scaling.
++//
++// Debounced over DEBOUNCE_N consecutive windows before flipping the
++// latched decision -- same "commit only after sustained agreement, don't
++// chase a single noisy reading" lesson pocsag_bitsync.v's own
++// locked-vs-searching resync gating already established for this project.
++//
++// THRESHOLD_SHIFT_WIDE/NARROW are EMPIRICALLY CALIBRATED, not guessed:
++// measured on real hardware, transmitting known deviations through this
++// project's own TX chain at a genuinely locked/decoding link (not just a
++// strong-signal/noise-floor guess -- confirmed via on_status's `locked`
++// and real decoded pages). At 2000Hz (narrowband-style) deviation,
++// abs_disc_sum/power_sum measured ~0.0123-0.0124; at 4500Hz (POCSAG
++// standard/wideband-style), ~0.0278-0.0279 -- a ratio of ~2.26x, matching
++// the deviation ratio (4500/2000 = 2.25) almost exactly, and both close to
++// the small-angle theoretical prediction (2*pi*f_dev/1e6: 0.0126 and
++// 0.0283 respectively). Also confirmed gain-independent: re-measured at a
++// completely different gain (TX=40/RX=50 vs TX=50/RX=55) and got the same
++// 0.0278 ratio at 4500Hz, as the normalize-by-power design intends. A
++// single shared shift of 6 (threshold 0.015625, sitting between the two
++// measured ratios with reasonable margin on each side -- ~1.3x above the
++// narrow measurement, ~1.8x below the wide one) cleanly separates them;
++// the original guessed values (10/12, i.e. thresholds ~0.001/0.00024) were
++// off by 4-6 octaves and would never have worked. See the project's plan
++// notes for the full calibration writeup (including two dead-end attempts:
++// too-low gain measured pure noise floor indistinguishable across
++// deviations, and the temporary debug output's first width had to be
++// widened from a bare 16-bit sum reading, which saturated even at a
++// genuinely-locked, non-overdriven signal level).
++//
++module channel_width_detect
++  (
++   input        clk,
++   input        reset,
++
++   // Filtered baseband -- the same signal fsk_demod.v itself consumes
++   // (pocsag_filt_strobe/pocsag_filt_sample in radio_legacy.v).
++   input        strobe,
++   input [31:0] sample,          // {I[15:0], Q[15:0]}
++
++   // fsk_demod.v's raw discriminator output (its disc_out/disc_valid).
++   input signed [32:0] disc,
++   input                disc_valid,
++
++   output reg width_narrow,      // 1 = narrowband (12.5kHz-style) classification
++   output reg width_locked       // debounce has settled -- see header
++   );
++
++   localparam WINDOW_LEN = 16'd4096;  // ~4.096ms at a 1MHz strobe rate
++   localparam DEBOUNCE_N = 4'd8;      // consecutive agreeing windows (~33ms) to (re)latch
++
++   // See header for the calibration measurement behind this value.
++   localparam THRESHOLD_SHIFT_WIDE   = 4'd6;
++   localparam THRESHOLD_SHIFT_NARROW = 4'd6;
++
++   wire signed [15:0] i_in = sample[31:16];
++   wire signed [15:0] q_in = sample[15:0];
++
++   // Power reference: same 3-stage multiply->sum pipeline style as
++   // clip_detect.v (its own header explains the timing/XST-fusion
++   // reasoning), computed independently here since it needs to be on the
++   // SAME (filtered) signal fsk_demod/disc is derived from, not
++   // clip_detect's pre-filter tap.
++   reg [31:0] i_sq, q_sq;
++   reg [31:0] power_sample;
++   reg        strobe_d1;
++
++   always @(posedge clk) begin
++      if (reset) begin
++         i_sq <= 32'd0;
++         q_sq <= 32'd0;
++         power_sample <= 32'd0;
++         strobe_d1 <= 1'b0;
++      end else begin
++         strobe_d1 <= strobe;
++         if (strobe) begin
++            i_sq <= i_in * i_in;
++            q_sq <= q_in * q_in;
++         end
++         if (strobe_d1)
++            power_sample <= i_sq + q_sq;
++      end
++   end
++
++   // |disc|, cheap (conditional two's-complement negate, no multiply).
++   wire [32:0] disc_abs = disc[32] ? (~disc + 33'd1) : disc;
++
++   // Per-window accumulators. Window length (4096) x worst-case per-sample
++   // magnitude comfortably fits 48 bits with wide margin -- LUT-cheap,
++   // this part of the chip (47% Slice LUTs used) isn't under the same
++   // pressure DSP48A1s are.
++   reg [15:0] win_cnt;
++   reg [47:0] power_sum, abs_disc_sum;
++
++   // Debounce: agree_cnt counts consecutive windows agreeing with
++   // pending_narrow; hitting DEBOUNCE_N (re)latches width_narrow/locked.
++   // A disagreeing window restarts the count in the new direction and
++   // drops width_locked until it reconverges. An ambiguous window (neither
++   // threshold crossed) leaves agree_cnt untouched -- doesn't advance
++   // toward relatching, but doesn't restart it either.
++   reg [3:0]  agree_cnt;
++   reg        pending_narrow;
++
++   always @(posedge clk) begin
++      if (reset) begin
++         win_cnt      <= 16'd0;
++         power_sum    <= 48'd0;
++         abs_disc_sum <= 48'd0;
++         agree_cnt    <= 4'd0;
++         pending_narrow <= 1'b0;
++         width_narrow <= 1'b0;   // default wide -- matches today's single (wideband) filter
++         width_locked <= 1'b0;
++      end else begin
++         if (strobe_d1)
++            power_sum <= power_sum + {16'd0, power_sample};
++         if (disc_valid)
++            abs_disc_sum <= abs_disc_sum + {15'd0, disc_abs};
++
++         // Window tick -- counts strobes (disc_valid runs at essentially
++         // the same rate, just fsk_demod's fixed few-cycle pipeline lag
++         // behind; that skew is irrelevant averaged over 4096 samples).
++         if (strobe) begin
++            if (win_cnt == WINDOW_LEN - 16'd1) begin
++               win_cnt <= 16'd0;
++
++               if (abs_disc_sum > (power_sum >> THRESHOLD_SHIFT_WIDE)) begin
++                  // Clearly wide this window.
++                  if (pending_narrow == 1'b0) begin
++                     if (agree_cnt < DEBOUNCE_N) agree_cnt <= agree_cnt + 4'd1;
++                  end else begin
++                     pending_narrow <= 1'b0;
++                     agree_cnt      <= 4'd1;
++                     width_locked   <= 1'b0;
++                  end
++               end else if (abs_disc_sum < (power_sum >> THRESHOLD_SHIFT_NARROW)) begin
++                  // Clearly narrow this window.
++                  if (pending_narrow == 1'b1) begin
++                     if (agree_cnt < DEBOUNCE_N) agree_cnt <= agree_cnt + 4'd1;
++                  end else begin
++                     pending_narrow <= 1'b1;
++                     agree_cnt      <= 4'd1;
++                     width_locked   <= 1'b0;
++                  end
++               end
++               // else: ambiguous window -- agree_cnt untouched.
++
++               if (agree_cnt >= DEBOUNCE_N) begin
++                  width_narrow <= pending_narrow;
++                  width_locked <= 1'b1;
++               end
++
++               power_sum    <= 48'd0;
++               abs_disc_sum <= 48'd0;
++            end else begin
++               win_cnt <= win_cnt + 16'd1;
++            end
++         end
++      end
++   end
++endmodule
+diff --git a/fpga/usrp3/lib/radio_200/clip_detect.v b/fpga/usrp3/lib/radio_200/clip_detect.v
+new file mode 100644
+index 000000000..35fa012da
+--- /dev/null
++++ b/fpga/usrp3/lib/radio_200/clip_detect.v
+@@ -0,0 +1,90 @@
++//
++// clip_detect: flags RX front-end saturation (ADC/DDC magnitude pegged near
++// full scale -- RX gain set too hot for the actual link) directly in
++// fabric, replacing a per-buffer software check
++// (`np.max(np.abs(buf[:n])) > CLIP_THRESHOLD` in transceiver.py) that
++// required the host to have real IQ samples in hand and scan every one of
++// them, every RX loop iteration. Taps sample_rx/strobe_rx directly -- PRE
++// pocsag_channel_filter, the same point that filter itself taps -- because
++// this needs to catch actual front-end overload, a property of the raw
++// signal, not the narrowed/filtered one downstream.
++//
++// Free-running clip_count[7:0] (wraps), exactly the same idiom
++// pocsag_framer.v already uses for codeword_count: the host reads it and
++// diffs against the last-seen value ((count - last) & 8'hFF), treating any
++// nonzero diff as "clipped since I last looked." No sticky flag, no
++// host-side clear needed -- one less thing to get wrong across a
++// disconnect/reconnect.
++//
++// Comparison is on I^2+Q^2 against a magnitude threshold squared (avoids a
++// sqrt -- exactly equivalent to comparing sqrt(I^2+Q^2) against a magnitude
++// threshold, just cheaper: two signed 16x16 multiplies, same order as
++// fsk_demod.v's own 2, well inside the spare DSP48A1 budget noted in
++// pocsag_channel_filter.v's header).
++//
++// THRESHOLD_MAG below (95% of int16 full scale, 32768) is EMPIRICALLY
++// CONFIRMED, not just assumed: calibrated against real hardware with a
++// temporary peak-hold diagnostic register (compared clip_detect's own raw
++// I^2+Q^2 against the host's np.max(np.abs(buf)) during deliberate extreme
++// overdrive -- both TX and RX gain maxed). Implied raw full-scale value was
++// 32767 (vs the 32768 assumed here, 1 LSB of rounding noise) and the
++// derived threshold was 31129 (vs 31130 configured) -- close enough to
++// call confirmed. Both sides also independently pegged at the same
++// saturation point during the test (I=Q=-32768, the ADC/DDC chain's own
++// clip_reg saturation logic, per ddc_chain.v), which is exactly the
++// front-end-overload condition this module exists to catch.
++//
++module clip_detect
++  (
++   input        clk,
++   input        reset,
++   input        strobe_rx,
++   input [31:0] sample_rx,       // {I[15:0], Q[15:0]}, same tap as pocsag_channel_filter
++   output reg [7:0] clip_count   // free-running, wraps -- see header
++   );
++
++   localparam [15:0] THRESHOLD_MAG = 16'd31130;
++   localparam [31:0] THRESHOLD_SQ  = THRESHOLD_MAG * THRESHOLD_MAG;
++
++   wire signed [15:0] i_in = sample_rx[31:16];
++   wire signed [15:0] q_in = sample_rx[15:0];
++
++   // Three explicit registered stages (multiply -> sum -> compare/count),
++   // not one big combinational block between two register stages -- the
++   // first cut of this had the sum and the compare both combinational in
++   // the same cycle, and XST's MAC-fusion optimizer folded the multiply in
++   // with it too, which together blew the clkout2 (~200MHz) timing
++   // constraint on real synthesis. Same root cause and same fix pattern
++   // pocsag_channel_filter.v's header documents for exactly this clock
++   // domain -- more (registered) stages, each one shallow, rather than one
++   // deep one. Ample slack for the extra cycle either way: strobe_rx runs
++   // ~32x slower than radio_clk.
++   reg [31:0] i_sq, q_sq;
++   reg [31:0] mag_sq;
++   reg        strobe_d1, strobe_d2;
++
++   always @(posedge clk) begin
++      if (reset) begin
++         i_sq       <= 32'd0;
++         q_sq       <= 32'd0;
++         mag_sq     <= 32'd0;
++         strobe_d1  <= 1'b0;
++         strobe_d2  <= 1'b0;
++         clip_count <= 8'd0;
++      end else begin
++         strobe_d1 <= strobe_rx;
++         strobe_d2 <= strobe_d1;
++
++         if (strobe_rx) begin
++            i_sq <= i_in * i_in;   // always non-negative -- fits unsigned
++            q_sq <= q_in * q_in;
++         end
++
++         if (strobe_d1)
++            mag_sq <= i_sq + q_sq;   // registered sum, its own stage
++
++         if (strobe_d2 && (mag_sq > THRESHOLD_SQ))
++            clip_count <= clip_count + 8'd1;
++      end
++   end
++endmodule
+diff --git a/fpga/usrp3/lib/radio_200/fsk_demod.v b/fpga/usrp3/lib/radio_200/fsk_demod.v
+new file mode 100644
+index 000000000..c11944bf4
+--- /dev/null
++++ b/fpga/usrp3/lib/radio_200/fsk_demod.v
+@@ -0,0 +1,120 @@
++//
++// fsk_demod.v
++//
++// Binary FSK/FM discriminator ("delay-and-multiply" quadrature detector)
++// operating on the decimated complex baseband samples ddc_chain already
++// produces, plus a raw bit-decision output meant to drive a GPIO pin
++// straight from fabric -- no software in the per-symbol path.
++//
++// Math: for consecutive complex baseband samples s[n] = I[n] + jQ[n], the
++// instantaneous frequency is arg(s[n] * conj(s[n-1])). A binary FSK slicer
++// only needs the SIGN of that angle (mark = positive deviation, space =
++// negative deviation), and sign(Im(s[n]*conj(s[n-1]))) gives exactly that
++// for any angle in (-180, +180) without an atan2/CORDIC:
++//
++//   s[n]*conj(s[n-1]) = (I[n]I[n-1] + Q[n]Q[n-1]) + j(Q[n]I[n-1] - I[n]Q[n-1])
++//
++// so bit_out = [ Q[n]*I[n-1] - I[n]*Q[n-1] >= 0 ]. Two 16x16 signed
++// multiplies (map onto the part's DSP48A1 slices) and a subtract.
++//
++// This is free-running off `strobe` -- no clock/symbol recovery here, just
++// a raw per-sample bit decision. Fine for seeing mark/space transitions on
++// a scope or a GPIO capture; a real bit synchronizer (matched filter +
++// timing recovery) is a follow-on, not attempted here.
++//
++
++module fsk_demod #(
++   parameter BASE = 0
++)(
++   input        clk,
++   input        reset,
++
++   // Settings bus
++   input        set_stb,
++   input [7:0]  set_addr,
++   input [31:0] set_data,
++
++   // Tap off the DDC chain: sample = {I[15:0], Q[15:0]}, valid when strobe.
++   input        strobe,
++   input [31:0] sample,
++
++   // Raw bit decision, registered, updated ~4 clocks after each strobe.
++   output reg   bit_out,
++   output reg   bit_valid,   // one-cycle pulse aligned with bit_out update
++
++   // The discriminator value itself (Im{s[n]*conj(s[n-1])}), before the
++   // hard mark/space slice -- exposed for channel_width_detect.v, which
++   // estimates FSK deviation from its statistical swing (narrower-channel
++   // conventions use smaller deviation, wider use larger) rather than
++   // running a second, DSP48A1-expensive bandpass filter pair to measure
++   // occupied bandwidth directly. Same timing as bit_out/bit_valid --
++   // plain wires, not new registers, since `disc` is already stable by
++   // the strobe_d3 cycle bit_out reads it on.
++   output [32:0] disc_out,
++   output        disc_valid
++);
++   assign disc_out   = disc;
++   assign disc_valid = bit_valid;
++
++   // Defaults to enabled at reset -- see the comment on the fp_gpio_atr
++   // instantiation in radio_legacy.v for why (no sanctioned host-software
++   // path reaches this register to turn it on at runtime).
++   wire enable;
++   setting_reg #(.my_addr(BASE), .awidth(8), .width(1), .at_reset(1)) sr_enable
++     (.clk(clk), .rst(reset), .strobe(set_stb), .addr(set_addr), .in(set_data),
++      .out(enable), .changed());
++
++   wire signed [15:0] i_in = sample[31:16];
++   wire signed [15:0] q_in = sample[15:0];
++
++   // Stage A: latch the current sample.
++   reg signed [15:0] i_cur, q_cur;
++   // Stage B: previous sample (one strobe period behind i_cur/q_cur).
++   reg signed [15:0] i_prev, q_prev;
++   reg signed [31:0] cross_a, cross_b;   // Q[n]*I[n-1], I[n]*Q[n-1]
++   // Stage C: the discriminator value itself.
++   reg signed [32:0] disc;               // Im{s[n]*conj(s[n-1])}
++
++   reg strobe_d1, strobe_d2, strobe_d3;
++
++   always @(posedge clk) begin
++      if (reset) begin
++         i_cur <= 16'sd0; q_cur <= 16'sd0;
++         i_prev <= 16'sd0; q_prev <= 16'sd0;
++         cross_a <= 32'sd0; cross_b <= 32'sd0;
++         disc <= 33'sd0;
++         bit_out <= 1'b0; bit_valid <= 1'b0;
++         strobe_d1 <= 1'b0; strobe_d2 <= 1'b0; strobe_d3 <= 1'b0;
++      end else begin
++         strobe_d1 <= strobe;
++         strobe_d2 <= strobe_d1;
++         strobe_d3 <= strobe_d2;
++
++         // Capture the new sample.
++         if (strobe) begin
++            i_cur <= i_in;
++            q_cur <= q_in;
++         end
++
++         // Cross-multiply current against previous, then shift previous
++         // forward -- ordered so the multiply below always sees this
++         // strobe's i_cur/q_cur against the *prior* strobe's i_prev/q_prev.
++         if (strobe_d1) begin
++            cross_a <= q_cur * i_prev;
++            cross_b <= i_cur * q_prev;
++            i_prev  <= i_cur;
++            q_prev  <= q_cur;
++         end
++
++         // Subtract (sign-extended to avoid overflow on the difference).
++         if (strobe_d2)
++            disc <= {cross_a[31], cross_a} - {cross_b[31], cross_b};
++
++         // Slice one cycle later so `disc` has settled.
++         bit_valid <= strobe_d3;
++         if (strobe_d3)
++            bit_out <= enable & ~disc[32];   // disc >= 0 -> bit=1 (mark)
++      end
++   end
++
++endmodule
+diff --git a/fpga/usrp3/lib/radio_200/gsc_framer.v b/fpga/usrp3/lib/radio_200/gsc_framer.v
+new file mode 100644
+index 000000000..4df522f8d
+--- /dev/null
++++ b/fpga/usrp3/lib/radio_200/gsc_framer.v
+@@ -0,0 +1,265 @@
++//
++// gsc_framer: batch/block synchronizer for GSC (Golay Sequential Code),
++// consuming the recovered one-symbol-per-clock stream from a
++// pocsag_bitsync instance (reused as-is at GSC's own sps -- see
++// radio_legacy.v's gsc_bitsync instantiation; that module was already
++// protocol-agnostic, nothing GSC-specific needed there).
++//
++// Framing facts (comma/half-bit-gap structure, LSB-first + doubled-bit
++// transmission, Word2=Word1-complement for the control word) come from
++// gsc.py's module docstring -- primary-source-confirmed (a Motorola
++// patent) plus cross-checked against multimon-ng's real, independent GSC
++// decoder (github.com/EliasOenal/multimon-ng, public domain). See there
++// for the full writeup; this module just implements the RX side of the
++// same wire format gsc.py's build_bitstream()/build_word_pair_bits()
++// produce on TX.
++//
++// Unlike pocsag_framer.v (fixed 16-codewords-per-batch, resyncs once per
++// batch), this project's own GSC convention puts a full comma before
++// EVERY block (not just the first -- see gsc.py's build_bitstream
++// docstring on why: GSC's real variable-length batches have no fixed
++// resync point analogous to POCSAG's, so this resyncs on every block
++// instead of tracking batch position). That trades a little airtime for
++// a simpler framer: no batch-length bookkeeping, self-heals every 121
++// symbols instead of only at batch boundaries.
++//
++// Sequence once locked: comma(28) -> Word1(46 raw symbols = 23 bits x2)
++// -> half-bit gap(1) -> Word2(46 raw symbols). Initial acquisition
++// correlates the very first Word1 against the known control-word pattern
++// (CONTROL_W1_PATTERN below, computed by gsc.py from CONTROL_WORD_INFO=713
++// -- see there); once found, subsequent blocks' Word1/Word2 are accepted
++// as-is (their content is real address/data payload, not a fixed
++// pattern) and shipped raw to host software for Golay decode -- same
++// division of labor as pocsag_framer.v (PHY/framing in fabric, FEC decode
++// in host software).
++//
++// Known, characterized edge case (confirmed on real hardware, digital
++// loopback): if a transmission's trailing control word is IMMEDIATELY
++// followed by another transmission's own fresh 200-bit preamble with zero
++// gap (e.g. concatenating repeat bursts bit-for-bit, the way
++// pocsag_framer.v's POCSAG side does safely), the comma-based per-block
++// resync above can transiently mistake preamble content for a comma+word
++// pair -- both are alternating patterns, and the comma check is
++// deliberately tolerant (COMMA_TOL below) the same way the word
++// correlator is. This is SAFE (the resulting garbage word1/word2 pair
++// fails Golay's error threshold on the host side -- gsc.LiveParser's
++// MAX_TRUSTED_ERRORS -- and is correctly discarded, never producing a
++// corrupted page) and self-healing (full ST_SEARCH correlation re-finds
++// the next real control word), but can cost throughput right at that
++// boundary. transceiver.py's PocsagTransmitter.send() works around this
++// on the TX side for GSC specifically (a real inter-repeat gap instead of
++// zero-gap concatenation) rather than making this module's resync more
++// elaborate to fully disambiguate every case.
++//
++module gsc_framer
++  (
++   input        clk,
++   input        reset,
++   input        en,
++   input        sym_bit,
++   input        sym_valid,
++   output reg [22:0] word1,
++   output reg [22:0] word2,
++   output reg        pair_valid,   // pulses one clk when word1/word2 are freshly captured
++   output reg [7:0]  pair_count,   // free-running, increments per pair_valid
++   output reg        locked
++   );
++
++   // 46-symbol transmission pattern for the control word's Word1
++   // (info=713 -- gsc.py's CONTROL_WORD_INFO -- Golay-encoded, then
++   // doubled+LSB-first per gsc.py's _codeword_symbols(), computed once in
++   // Python and pasted here as a fixed correlation target). Same
++   // technique pocsag_framer.v uses for its own SYNC_WORD, just longer
++   // (46 vs 32 bits) and against a value this project's own gsc.py
++   // computes, not a POCSAG-spec constant. Word 2's expected pattern is
++   // this value's bitwise complement -- verified in gsc.py's own test
++   // suite that Word2=Word1-codeword-complement is always another valid
++   // Golay codeword, and that relationship survives the doubling/
++   // bit-reversal transmission encoding unchanged (also confirmed there).
++   localparam [45:0] CONTROL_W1_PATTERN = 46'h30c3cc3c000c;
++   localparam [5:0]  HAMMING_TOL = 6'd4;  // ~9% of 46 bits, similar margin to
++                                          // pocsag_framer's 2/32 (~6%)
++
++   localparam ST_SEARCH = 3'd0;  // sliding-window correlating for the control word
++   localparam ST_GAP    = 3'd1;  // the 1-symbol half-bit gap after a word1
++   localparam ST_WORD2  = 3'd2;  // reading word2 (46 symbols)
++   localparam ST_COMMA  = 3'd3;  // reading/verifying the 28-symbol comma before the next word1
++   localparam ST_WORD1  = 3'd4;  // reading word1 (46 symbols, any content -- already locked)
++
++   reg [2:0]  state;
++   reg [45:0] sr;          // rolling/accumulating shift register
++   reg [6:0]  sym_cnt;     // position within the current comma/word1/word2 run
++   reg        polarity_inverted;
++
++   function [5:0] popcount46;
++      input [45:0] v;
++      integer      i;
++      begin
++         popcount46 = 6'd0;
++         for (i = 0; i < 46; i = i + 1)
++            popcount46 = popcount46 + {5'd0, v[i]};
++      end
++   endfunction
++
++   wire [45:0] shifted_sr = {sr[44:0], sym_bit};
++   wire [45:0] xor_a = shifted_sr ^ CONTROL_W1_PATTERN;
++   wire [45:0] xor_b = shifted_sr ^ ~CONTROL_W1_PATTERN;
++   wire        match_a = (popcount46(xor_a) <= HAMMING_TOL);
++   wire        match_b = (popcount46(xor_b) <= HAMMING_TOL);
++
++   // word[i] = raw46[45 - 2*i] -- de-doubles (keeps the first copy of
++   // each repeated bit) and un-reverses the LSB-first transmission order
++   // in one step (see gsc.py's module docstring on bit order: symbol i
++   // and i+1 both carry codeword bit i//2, transmitted LSB-first, so the
++   // first-arrived copy of codeword bit k sits 45-2k positions from the
++   // shift register's newest end). Pure wiring, no logic.
++   function [22:0] extract_word;
++      input [45:0] raw46;
++      integer      i;
++      begin
++         for (i = 0; i < 23; i = i + 1)
++            extract_word[i] = raw46[45 - 2*i];
++      end
++   endfunction
++
++   // Comma check: 28 symbols, alternating, tolerant of a few mismatches --
++   // same Hamming-tolerant philosophy as the word correlator above, just
++   // checking "did every adjacent pair toggle" instead of matching a
++   // fixed pattern (the comma's own polarity varies with whatever word1
++   // follows it -- see gsc.py's comma_bits()). Built from shifted_sr, not
++   // the registered sr -- same reasoning as extract_word(shifted_sr) above
++   // in ST_WORD1/ST_WORD2: on the cycle the 28th symbol arrives, sr itself
++   // still only holds the first 27 (this cycle's update hasn't landed
++   // yet), so checking against sr instead of shifted_sr would compare
++   // against a stale, never-shifted-in bit 27 -- caught by a real-hardware
++   // loopback test, not by inspection (round 1 of this module locked onto
++   // the first control word fine via ST_SEARCH's own direct correlation,
++   // then failed nearly every comma re-check afterward and kept dropping
++   // back to search). shifted_sr[27:0] holds the last 28 symbols once a
++   // comma run completes; XOR each bit against its neighbor -- a clean
++   // alternating run makes every one of those XORs a 1, so counting the
++   // 0s directly gives the mismatch count.
++   wire [26:0] comma_xor = shifted_sr[27:1] ^ shifted_sr[26:0];
++   function [4:0] comma_mismatches;
++      input [26:0] x;
++      integer      i;
++      begin
++         comma_mismatches = 5'd0;
++         for (i = 0; i < 27; i = i + 1)
++            comma_mismatches = comma_mismatches + {4'd0, ~x[i]};
++      end
++   endfunction
++   localparam [4:0] COMMA_TOL = 5'd3;  // out of 27 adjacent-pair checks
++
++   always @(posedge clk) begin
++      if (reset || !en) begin
++         state              <= ST_SEARCH;
++         sr                 <= 46'd0;
++         sym_cnt            <= 7'd0;
++         polarity_inverted  <= 1'b0;
++         word1              <= 23'd0;
++         word2              <= 23'd0;
++         pair_valid         <= 1'b0;
++         pair_count         <= 8'd0;
++         locked             <= 1'b0;
++      end else begin
++         pair_valid <= 1'b0;
++
++         if (sym_valid) begin
++            case (state)
++
++              // Slide a 46-bit window over the incoming stream, looking
++              // for the control word's Word1 (either polarity -- 2-FSK's
++              // inherent mark/space ambiguity, same reasoning
++              // pocsag_framer.v's dual xor_a/xor_b match already uses).
++              ST_SEARCH: begin
++                 locked <= 1'b0;
++                 sr     <= shifted_sr;
++                 if (match_a || match_b) begin
++                    polarity_inverted <= match_b;
++                    word1   <= match_b ? ~extract_word(shifted_sr) : extract_word(shifted_sr);
++                    sym_cnt <= 7'd0;
++                    state   <= ST_GAP;
++                 end
++              end
++
++              // Exactly one symbol, ignored -- its own value carries no
++              // information beyond timing (gsc.py's half_bit_gap_polarity
++              // is derived from word2's first bit, not independently
++              // meaningful on receive).
++              ST_GAP: begin
++                 sr      <= 46'd0;
++                 sym_cnt <= 7'd0;
++                 state   <= ST_WORD2;
++              end
++
++              ST_WORD2: begin
++                 sr <= shifted_sr;
++                 if (sym_cnt == 7'd45) begin
++                    word2      <= polarity_inverted ? ~extract_word(shifted_sr) : extract_word(shifted_sr);
++                    pair_valid <= 1'b1;
++                    pair_count <= pair_count + 8'd1;
++                    locked     <= 1'b1;
++                    sr         <= 46'd0;
++                    sym_cnt    <= 7'd0;
++                    state      <= ST_COMMA;
++                 end else begin
++                    sym_cnt <= sym_cnt + 7'd1;
++                 end
++              end
++
++              // Ongoing (already-locked) block tracking: verify the next
++              // comma still looks like a comma -- if it doesn't, that's
++              // this design's only "are we still in sync" signal (no
++              // batch-length bookkeeping to fall back on -- see header),
++              // so drop back to searching rather than trust a
++              // possibly-slipped bit position.
++              ST_COMMA: begin
++                 sr <= shifted_sr;
++                 if (sym_cnt == 7'd27) begin
++                    if (comma_mismatches(comma_xor) <= COMMA_TOL) begin
++                       sr      <= 46'd0;
++                       sym_cnt <= 7'd0;
++                       state   <= ST_WORD1;
++                    end else begin
++                       locked  <= 1'b0;
++                       sr      <= 46'd0;
++                       sym_cnt <= 7'd0;
++                       state   <= ST_SEARCH;
++                    end
++                 end else begin
++                    sym_cnt <= sym_cnt + 7'd1;
++                 end
++              end
++
++              ST_WORD1: begin
++                 sr <= shifted_sr;
++                 if (sym_cnt == 7'd45) begin
++                    word1   <= polarity_inverted ? ~extract_word(shifted_sr) : extract_word(shifted_sr);
++                    sr      <= 46'd0;
++                    sym_cnt <= 7'd0;
++                    state   <= ST_GAP;
++                 end else begin
++                    sym_cnt <= sym_cnt + 7'd1;
++                 end
++              end
++
++              // state is 3 bits but only 5 of 8 encodings are used above;
++              // a clocked case with missing arms just holds previous state
++              // (normal flip-flop behavior, not a latch-inference risk --
++              // unlike a combinational always @*), but an unreachable
++              // encoding reached via e.g. an SEU would otherwise wedge the
++              // FSM permanently since nothing would ever match it again.
++              // Recover to ST_SEARCH instead.
++              default: begin
++                 locked  <= 1'b0;
++                 sr      <= 46'd0;
++                 sym_cnt <= 7'd0;
++                 state   <= ST_SEARCH;
++              end
++
++            endcase
++         end
++      end
++   end
++endmodule
+diff --git a/fpga/usrp3/lib/radio_200/pocsag_bitsync.v b/fpga/usrp3/lib/radio_200/pocsag_bitsync.v
+new file mode 100644
+index 000000000..6fc19394b
+--- /dev/null
++++ b/fpga/usrp3/lib/radio_200/pocsag_bitsync.v
+@@ -0,0 +1,91 @@
++//
++// pocsag_bitsync: recovers per-bit timing from an oversampled 1-bit FSK
++// discriminator stream (see fsk_demod.v) so downstream logic sees exactly
++// one decision per POCSAG bit period, instead of one per RX sample.
++//
++// Technique: a free-running sample counter divides by `sps` (samples per
++// bit, set by the host from the chosen POCSAG rate and the configured RX
++// sample rate) and emits a majority-vote (integrate-and-dump) bit decision
++// every time it wraps. Between wraps, WHILE NOT YET LOCKED (framer_locked
++// low -- still searching for the frame sync word), any transition of the
++// raw discriminator bit that lands away from either edge of the window
++// (i.e. clearly mid-window, not just jitter right at a boundary) is
++// treated as evidence we've drifted out of phase, and forces an early
++// wrap right on that transition; this converges to a solid lock during
++// POCSAG's long alternating-bit preamble, fast.
++//
++// Once framer_locked goes high, this edge-triggered resync is disabled
++// and the divider just free-runs. That's deliberate, not a simplification
++// left on the table: TX and RX here share the same on-board reference
++// clock (same physical radio, no independent oscillators), so once
++// correctly phase-aligned there is no clock drift to track -- continuing
++// to hard-resync on every mid-window transition instead means any single
++// noisy discriminator sample (routine on a real RF path, never seen over
++// the internal digital loopback this was first validated against) can
++// throw away a good lock and restart the integration window from
++// scratch. Free-running after lock is both simpler and more robust here.
++module pocsag_bitsync
++  (
++   input        clk,
++   input        reset,
++   input        en,             // must be held while sps is valid; clears state when low
++   input [15:0] sps,            // samples per bit (RX rate / POCSAG bit rate), host-set
++   input        raw_bit,        // fsk_demod.bit_out
++   input        raw_bit_valid,  // fsk_demod.bit_valid
++   input        framer_locked,  // pocsag_framer.locked -- gates edge-triggered resync, see above
++   output reg        sym_bit,   // recovered bit decision
++   output reg        sym_valid  // pulses one clk when sym_bit is valid
++   );
++
++   // Quarter-window guard band: a mid-window transition outside
++   // [sps/4, sps - sps/4) is considered "on time" jitter, not drift.
++   wire [15:0] guard = {2'b0, sps[15:2]}; // sps >> 2
++
++   reg [15:0]  cnt;
++   reg [15:0]  ones_accum;
++   reg         prev_bit;
++   reg         first;
++
++   wire        window_done = (cnt >= sps);
++   wire        mid_window  = (cnt > guard) && (cnt < (sps - guard));
++   wire        is_edge     = raw_bit != prev_bit;
++
++   always @(posedge clk) begin
++      if (reset || !en || (sps < 16'd2)) begin
++         cnt        <= 16'd0;
++         ones_accum <= 16'd0;
++         prev_bit   <= 1'b0;
++         first      <= 1'b1;
++         sym_bit    <= 1'b0;
++         sym_valid  <= 1'b0;
++      end else begin
++         sym_valid <= 1'b0;
++
++         if (raw_bit_valid) begin
++            if (first) begin
++               first      <= 1'b0;
++               prev_bit   <= raw_bit;
++               cnt        <= 16'd1;
++               ones_accum <= {15'd0, raw_bit};
++            end else if (is_edge && mid_window && !framer_locked) begin
++               // Drifted -- resync hard on this transition.
++               sym_bit    <= (({ones_accum, 1'b0}) >= {1'b0, cnt}); // ones_accum*2 >= cnt
++               sym_valid  <= 1'b1;
++               prev_bit   <= raw_bit;
++               cnt        <= 16'd1;
++               ones_accum <= {15'd0, raw_bit};
++            end else if (window_done) begin
++               sym_bit    <= (({ones_accum, 1'b0}) >= {1'b0, sps});  // ones_accum*2 >= sps
++               sym_valid  <= 1'b1;
++               prev_bit   <= raw_bit;
++               cnt        <= 16'd1;
++               ones_accum <= {15'd0, raw_bit};
++            end else begin
++               prev_bit   <= raw_bit;
++               cnt        <= cnt + 16'd1;
++               ones_accum <= ones_accum + {15'd0, raw_bit};
++            end
++         end
++      end
++   end
++endmodule
+diff --git a/fpga/usrp3/lib/radio_200/pocsag_channel_filter.v b/fpga/usrp3/lib/radio_200/pocsag_channel_filter.v
+new file mode 100644
+index 000000000..2aed7dea6
+--- /dev/null
++++ b/fpga/usrp3/lib/radio_200/pocsag_channel_filter.v
+@@ -0,0 +1,212 @@
++//
++// pocsag_channel_filter: narrowband lowpass ahead of fsk_demod's
++// discriminator, to fix the FM/FSK "threshold effect" measured on real RF
++// (see the design notes this came out of): a delay-and-multiply
++// discriminator's output SNR scales with the *square* of the deviation for
++// a *fixed* input noise bandwidth, so running it straight off ddc_chain's
++// full-bandwidth output (effectively hundreds of kHz of noise, vs.
++// POCSAG's actual ~15-20kHz channel) meant standard +/-4500Hz deviation
++// collapsed completely while a much larger deviation worked -- confirmed
++// empirically with a deviation sweep before this filter existed. This
++// narrows the noise bandwidth instead of inflating the deviation, which is
++// what real POCSAG hardware/software decoders do too: SDRangel's pager
++// demod plugin (a mature, widely-used open-source implementation) defaults
++// to a 20kHz RF bandwidth filter ahead of its discriminator, at the same
++// 4500Hz spec deviation -- this filter's cutoff matches that reference
++// point.
++//
++// 31-tap symmetric (linear-phase) FIR lowpass, Hamming-windowed sinc,
++// ~20kHz cutoff at a 1MHz sample rate (see the design notes for the Python
++// that generated the coefficients). Tap symmetry halves the multiplier
++// count: mirrored delay-line samples are added *before* multiplying by
++// the shared coefficient, so this costs 16 real multiplies per channel
++// (32 total for I+Q) instead of 31, well inside the spare DSP48A1 budget
++// (54 of 132 free after fsk_demod's own 2). Runs at the input sample rate
++// (whatever strobe_rx's rate is) -- no decimation, so it's a drop-in tap
++// that doesn't disturb the existing sample_rx/strobe_rx path anything
++// else consumes.
++//
++// Pipelined across 4 clock cycles (shift -> pair-sum -> multiply ->
++// sum+scale), instead of one big combinational block: strobe_rx is ~32x
++// slower than radio_clk (1MHz vs 32MHz), so there's ample slack for a few
++// cycles of pipeline latency, and the very first cut of this (everything
++// combinational between two register stages) blew the clkout1/clkout2
++// timing constraints that had comfortable margin before this filter
++// existed -- 16 DSP48A1 multiplies feeding straight into a 15-way adder
++// tree in one cycle was simply too much combinational depth. Splitting
++// pair-sum, multiply, and sum+scale into their own registered stages
++// fixed it (each stage is now shallow enough on its own).
++//
++// Coefficients sum to exactly 2^15, so the final stage is just the 40-bit
++// MAC sum arithmetic-shifted right by 15 (unity DC gain) and truncated
++// back to 16 bits -- no explicit saturation logic; a proper unity-gain
++// lowpass shouldn't meaningfully overshoot a well-behaved input's range,
++// and Hamming windowing keeps FIR ripple/overshoot low.
++//
++module pocsag_channel_filter
++  (
++   input        clk,
++   input        reset,
++   input        strobe_in,
++   input [31:0] sample_in,    // {i[15:0], q[15:0]}, same format as ddc_chain's sample_rx
++   output reg        strobe_out,
++   output reg [31:0] sample_out
++   );
++
++   localparam signed [15:0] C0  = 16'sd89;
++   localparam signed [15:0] C1  = 16'sd111;
++   localparam signed [15:0] C2  = 16'sd162;
++   localparam signed [15:0] C3  = 16'sd246;
++   localparam signed [15:0] C4  = 16'sd365;
++   localparam signed [15:0] C5  = 16'sd519;
++   localparam signed [15:0] C6  = 16'sd705;
++   localparam signed [15:0] C7  = 16'sd915;
++   localparam signed [15:0] C8  = 16'sd1140;
++   localparam signed [15:0] C9  = 16'sd1371;
++   localparam signed [15:0] C10 = 16'sd1595;
++   localparam signed [15:0] C11 = 16'sd1799;
++   localparam signed [15:0] C12 = 16'sd1972;
++   localparam signed [15:0] C13 = 16'sd2103;
++   localparam signed [15:0] C14 = 16'sd2186;
++   localparam signed [15:0] C15 = 16'sd2212; // center tap
++
++   // ---- Stage 0: delay line (31 taps deep, shifts on strobe_in) ----
++   reg signed [15:0] i_dly [0:30];
++   reg signed [15:0] q_dly [0:30];
++   integer k;
++
++   always @(posedge clk) begin
++      if (reset) begin
++         for (k = 0; k < 31; k = k + 1) begin
++            i_dly[k] <= 16'sd0;
++            q_dly[k] <= 16'sd0;
++         end
++      end else if (strobe_in) begin
++         i_dly[0] <= sample_in[31:16];
++         q_dly[0] <= sample_in[15:0];
++         for (k = 30; k > 0; k = k - 1) begin
++            i_dly[k] <= i_dly[k-1];
++            q_dly[k] <= q_dly[k-1];
++         end
++      end
++   end
++
++   // ---- Stage 1: mirrored pair sums, registered ----
++   reg        strobe_p1;
++   reg signed [16:0] i_pair_r [0:14];
++   reg signed [16:0] q_pair_r [0:14];
++   reg signed [15:0] i_ctr_r, q_ctr_r;
++   integer m;
++
++   always @(posedge clk) begin
++      if (reset) begin
++         strobe_p1 <= 1'b0;
++         i_ctr_r   <= 16'sd0;
++         q_ctr_r   <= 16'sd0;
++         for (m = 0; m < 15; m = m + 1) begin
++            i_pair_r[m] <= 17'sd0;
++            q_pair_r[m] <= 17'sd0;
++         end
++      end else begin
++         strobe_p1 <= strobe_in;
++         if (strobe_in) begin
++            for (m = 0; m < 15; m = m + 1) begin
++               i_pair_r[m] <= i_dly[m] + i_dly[30-m];
++               q_pair_r[m] <= q_dly[m] + q_dly[30-m];
++            end
++            i_ctr_r <= i_dly[15];
++            q_ctr_r <= q_dly[15];
++         end
++      end
++   end
++
++   // ---- Stage 2: multiply by shared coefficients, registered ----
++   reg        strobe_p2;
++   reg signed [34:0] i_prod_r [0:14];
++   reg signed [34:0] q_prod_r [0:14];
++   reg signed [33:0] i_prod15_r, q_prod15_r;
++
++   wire signed [15:0] coef [0:14];
++   assign coef[0]=C0;  assign coef[1]=C1;  assign coef[2]=C2;   assign coef[3]=C3;
++   assign coef[4]=C4;  assign coef[5]=C5;  assign coef[6]=C6;   assign coef[7]=C7;
++   assign coef[8]=C8;  assign coef[9]=C9;  assign coef[10]=C10; assign coef[11]=C11;
++   assign coef[12]=C12; assign coef[13]=C13; assign coef[14]=C14;
++
++   always @(posedge clk) begin
++      if (reset) begin
++         strobe_p2  <= 1'b0;
++         i_prod15_r <= 34'sd0;
++         q_prod15_r <= 34'sd0;
++         for (m = 0; m < 15; m = m + 1) begin
++            i_prod_r[m] <= 35'sd0;
++            q_prod_r[m] <= 35'sd0;
++         end
++      end else begin
++         strobe_p2 <= strobe_p1;
++         if (strobe_p1) begin
++            for (m = 0; m < 15; m = m + 1) begin
++               i_prod_r[m] <= i_pair_r[m] * coef[m];
++               q_prod_r[m] <= q_pair_r[m] * coef[m];
++            end
++            i_prod15_r <= i_ctr_r * C15;
++            q_prod15_r <= q_ctr_r * C15;
++         end
++      end
++   end
++
++   // ---- Stage 3: partial sums (two 8-way adds instead of one 16-way add),
++   // registered. The single 16-way adder tree that used to live here (see
++   // git history) left clkout2 (5ns period, 200MHz) 0.12ns over budget --
++   // small, but still a real miss. Splitting it into two shallower halves,
++   // each its own registered stage, closes that gap.
++   wire signed [37:0] i_sum_lo = i_prod_r[0] + i_prod_r[1] + i_prod_r[2] + i_prod_r[3] +
++                                 i_prod_r[4] + i_prod_r[5] + i_prod_r[6] + i_prod_r[7];
++   wire signed [37:0] i_sum_hi = i_prod_r[8] + i_prod_r[9] + i_prod_r[10] + i_prod_r[11] +
++                                 i_prod_r[12] + i_prod_r[13] + i_prod_r[14] + i_prod15_r;
++   wire signed [37:0] q_sum_lo = q_prod_r[0] + q_prod_r[1] + q_prod_r[2] + q_prod_r[3] +
++                                 q_prod_r[4] + q_prod_r[5] + q_prod_r[6] + q_prod_r[7];
++   wire signed [37:0] q_sum_hi = q_prod_r[8] + q_prod_r[9] + q_prod_r[10] + q_prod_r[11] +
++                                 q_prod_r[12] + q_prod_r[13] + q_prod_r[14] + q_prod15_r;
++
++   reg        strobe_p3;
++   reg signed [37:0] i_sum_lo_r, i_sum_hi_r, q_sum_lo_r, q_sum_hi_r;
++
++   always @(posedge clk) begin
++      if (reset) begin
++         strobe_p3  <= 1'b0;
++         i_sum_lo_r <= 38'sd0;
++         i_sum_hi_r <= 38'sd0;
++         q_sum_lo_r <= 38'sd0;
++         q_sum_hi_r <= 38'sd0;
++      end else begin
++         strobe_p3 <= strobe_p2;
++         if (strobe_p2) begin
++            i_sum_lo_r <= i_sum_lo;
++            i_sum_hi_r <= i_sum_hi;
++            q_sum_lo_r <= q_sum_lo;
++            q_sum_hi_r <= q_sum_hi;
++         end
++      end
++   end
++
++   // ---- Stage 4: final sum + scale, registered (output) ----
++   wire signed [39:0] i_sum = i_sum_lo_r + i_sum_hi_r;
++   wire signed [39:0] q_sum = q_sum_lo_r + q_sum_hi_r;
++
++   // >>>15 for unity DC gain. Named wires (not inline expressions) because
++   // Verilog-2001 part-selects only apply to a net/reg, not to an arbitrary
++   // expression -- (i_sum >>> 15)[15:0] isn't legal syntax.
++   wire signed [39:0] i_scaled = i_sum >>> 15;
++   wire signed [39:0] q_scaled = q_sum >>> 15;
++
++   always @(posedge clk) begin
++      if (reset) begin
++         strobe_out <= 1'b0;
++         sample_out <= 32'd0;
++      end else begin
++         strobe_out <= strobe_p3;
++         if (strobe_p3)
++            sample_out <= {i_scaled[15:0], q_scaled[15:0]};
++      end
++   end
++endmodule
+diff --git a/fpga/usrp3/lib/radio_200/pocsag_framer.v b/fpga/usrp3/lib/radio_200/pocsag_framer.v
+new file mode 100644
+index 000000000..81a017aa3
+--- /dev/null
++++ b/fpga/usrp3/lib/radio_200/pocsag_framer.v
+@@ -0,0 +1,106 @@
++//
++// pocsag_framer: batch/frame synchronizer for POCSAG. Consumes the
++// recovered one-bit-per-symbol stream from pocsag_bitsync and finds the
++// 32-bit frame sync code (0x7CD215D8), which also resolves the FSK
++// polarity ambiguity (since 2-FSK on its own can't tell you which tone is
++// "1" -- only the sync word's known bit pattern can). Once locked, shifts
++// out each subsequent 32-bit codeword raw (still BCH-encoded -- decode and
++// error correction happen in host software, this is PHY/framing only).
++// After 16 codewords (8 frames x 2 words = one full batch), drops back to
++// searching for the next sync word rather than assuming continued
++// alignment, so any bit slip self-heals at the next batch boundary.
++//
++module pocsag_framer
++  (
++   input        clk,
++   input        reset,
++   input        en,
++   input        sym_bit,
++   input        sym_valid,
++   output reg [31:0] codeword,
++   output reg        codeword_valid,  // pulses one clk when codeword is a freshly captured word
++   output reg [7:0]  codeword_count,  // free-running, increments per codeword_valid -- host's
++                                       // "new data" indicator (compare against last-seen value)
++   output reg        locked
++   );
++
++   localparam SYNC_WORD  = 32'h7CD215D8;
++   localparam HAMMING_TOL = 2; // allow up to this many bit errors when matching the sync word
++
++   localparam ST_SEARCH = 1'b0;
++   localparam ST_LOCKED = 1'b1;
++
++   reg        state;
++   reg [31:0] sr;
++   reg [5:0]  bit_cnt;   // 0..31 within the current codeword
++   reg [4:0]  cw_cnt;    // 0..15 codewords within the current batch
++   reg        polarity_invert;
++
++   wire [31:0] shifted_sr = {sr[30:0], sym_bit};
++   wire [31:0] xor_a = shifted_sr ^ SYNC_WORD;
++   wire [31:0] xor_b = shifted_sr ^ ~SYNC_WORD;
++
++   function [5:0] popcount32;
++      input [31:0] v;
++      integer      i;
++      begin
++         popcount32 = 6'd0;
++         for (i = 0; i < 32; i = i + 1)
++            popcount32 = popcount32 + {5'd0, v[i]};
++      end
++   endfunction
++
++   wire match_a = (popcount32(xor_a) <= HAMMING_TOL[5:0]);
++   wire match_b = (popcount32(xor_b) <= HAMMING_TOL[5:0]);
++
++   always @(posedge clk) begin
++      if (reset || !en) begin
++         state           <= ST_SEARCH;
++         sr              <= 32'd0;
++         bit_cnt         <= 6'd0;
++         cw_cnt          <= 5'd0;
++         polarity_invert <= 1'b0;
++         codeword        <= 32'd0;
++         codeword_valid  <= 1'b0;
++         codeword_count  <= 8'd0;
++         locked          <= 1'b0;
++      end else begin
++         codeword_valid <= 1'b0;
++
++         if (sym_valid) begin
++            sr <= shifted_sr;
++
++            case (state)
++              ST_SEARCH: begin
++                 locked <= 1'b0;
++                 if (match_a || match_b) begin
++                    state           <= ST_LOCKED;
++                    polarity_invert <= match_b; // matched the inverted sync word -> flip payload bits
++                    bit_cnt         <= 6'd0;
++                    cw_cnt          <= 5'd0;
++                    locked          <= 1'b1;
++                 end
++              end
++
++              ST_LOCKED: begin
++                 if (bit_cnt == 6'd31) begin
++                    codeword       <= polarity_invert ? ~shifted_sr : shifted_sr;
++                    codeword_valid <= 1'b1;
++                    codeword_count <= codeword_count + 8'd1;
++                    bit_cnt        <= 6'd0;
++                    if (cw_cnt == 5'd15) begin
++                       // End of batch -- re-verify sync rather than assume alignment holds.
++                       state  <= ST_SEARCH;
++                       cw_cnt <= 5'd0;
++                    end else begin
++                       cw_cnt <= cw_cnt + 5'd1;
++                    end
++                 end else begin
++                    bit_cnt <= bit_cnt + 6'd1;
++                 end
++              end
++            endcase
++         end
++      end
++   end
++endmodule
+diff --git a/fpga/usrp3/lib/radio_200/radio_legacy.v b/fpga/usrp3/lib/radio_200/radio_legacy.v
+index 76183b493..aac7c8fcf 100644
+--- a/fpga/usrp3/lib/radio_200/radio_legacy.v
++++ b/fpga/usrp3/lib/radio_200/radio_legacy.v
+@@ -85,6 +85,64 @@ module radio_legacy
+    wire 	 rx_tready_int, rx_tvalid_int;
+    wire 	 rx_tlast_int;
+ 
++   // Declared up here (rather than next to its driving fsk_demod instance,
++   // down by ddc_chain) because XST's generate-block elaboration didn't
++   // reliably pick up a forward reference to it from inside the
++   // `add_fp_gpio` generate block below -- it silently decided the driving
++   // assignment was dead ("Assignment to fsk_bit_out ignored, since the
++   // identifier is never used") and optimized the whole fsk_demod instance
++   // away. Declaring it before that generate block avoids the issue.
++   wire fsk_bit_out, fsk_bit_valid;
++
++   // Same reasoning: declared here, ahead of the USER_SETTINGS generate
++   // block that drives it (down near the SR_LOOPBACK register) and the
++   // rx_fe mux that reads it (down by ddc_chain).
++   wire user_loopback;
++
++   // Same reasoning again, both directions: pocsag_sps/pocsag_en are driven
++   // inside the USER_SETTINGS generate block but consumed by pocsag_bitsync
++   // (instantiated later, by ddc_chain); pocsag_codeword/codeword_valid/
++   // codeword_count/locked are driven by pocsag_framer (also down there)
++   // but read from inside the (earlier-appearing) USER_SETTINGS generate
++   // block's readback case statement.
++   wire [15:0] pocsag_sps;
++   wire        pocsag_en;
++   wire [31:0] pocsag_codeword;
++   wire        pocsag_codeword_valid;
++   wire [7:0]  pocsag_codeword_count;
++   wire        pocsag_locked;
++
++   // Same forward-declaration reasoning as pocsag_codeword etc. above:
++   // clip_detect is instantiated down by ddc_chain, but read from inside
++   // the (earlier-appearing) USER_SETTINGS generate block's readback case
++   // statement (RB_PHY_STATUS).
++   wire [7:0]  clip_count;
++
++   // Same forward-declaration reasoning again: fsk_demod's new disc
++   // outputs are consumed by channel_width_detect (instantiated further
++   // down, by fsk_demod); channel_width_detect's own outputs are read from
++   // inside the USER_SETTINGS readback case statement above.
++   wire [32:0] fsk_disc_out;
++   wire        fsk_disc_valid;
++   wire        channel_width_narrow, channel_width_locked;
++
++   // Same forward-declaration reasoning again: gsc_sps/gsc_en are driven
++   // inside the USER_SETTINGS generate block but consumed by gsc_bitsync/
++   // gsc_framer (instantiated later, alongside their POCSAG counterparts);
++   // the framer's word1/word2/pair_valid/pair_count/locked are driven
++   // there but read from inside the (earlier-appearing) USER_SETTINGS
++   // readback case statement (RB_GSC_STATUS). gsc_bitsync is just a second
++   // instance of the existing pocsag_bitsync module -- it was already
++   // protocol-agnostic (sps/en/raw_bit in, sym_bit/sym_valid out, nothing
++   // POCSAG-specific about its logic), so GSC reuses it as-is at its own
++   // 600-baud sps rather than needing a variant.
++   wire [15:0] gsc_sps;
++   wire        gsc_en;
++   wire [22:0] gsc_word1, gsc_word2;
++   wire        gsc_pair_valid;
++   wire [7:0]  gsc_pair_count;
++   wire        gsc_locked;
++
+ 
+    axi_fifo_2clk #(.WIDTH(65), .SIZE(0/*minimal*/)) ctrl_fifo
+      (.reset(bus_rst),
+@@ -124,6 +182,7 @@ module radio_legacy
+    localparam SR_ATR          = 8'd12; // thorugh 8'd18
+    localparam SR_TEST         = 8'd21;
+    localparam SR_CODEC_IDLE   = 8'd22;
++   localparam SR_FSK_DEMOD    = 8'd24;
+    localparam SR_READBACK     = 8'd32;
+    localparam SR_TX_CTRL      = 8'd64;
+    localparam SR_RX_CTRL      = 8'd96;
+@@ -207,15 +266,81 @@ generate
+         (.clk(radio_clk), .rst(radio_rst), .strobe(set_stb_user), .addr(set_addr_user), .in(set_data_user),
+          .out(user_reg_1_value), .changed());
+ 
++      // Host-reachable twin of the pre-existing (but unreachable -- nothing
++      // ever writes SR_LOOPBACK) `sr_loopback` register below. ORed into the
++      // same mux select so either path can assert it. Byte address from
++      // get_user_settings_iface(): poke32(2*4, 1) to enable, poke32(8, 0) to
++      // disable.
++      wire [31:0] user_loopback_value;
++
++      setting_reg #(.my_addr(8'd2), .awidth(8), .width(32)) user_reg_loopback
++        (.clk(radio_clk), .rst(radio_rst), .strobe(set_stb_user), .addr(set_addr_user), .in(set_data_user),
++         .out(user_loopback_value), .changed());
++
++      assign user_loopback = user_loopback_value[0];
++
++      // POCSAG PHY control: bits[15:0] = samples-per-bit (RX rate / POCSAG
++      // bit rate, host computes this from whatever rate it configured);
++      // bit[16] = enable (also asynchronously resets the bitsync/framer
++      // state machines while low). poke32(3*4, value) to set.
++      wire [31:0] pocsag_ctrl_value;
++
++      setting_reg #(.my_addr(8'd3), .awidth(8), .width(32)) user_reg_pocsag_ctrl
++        (.clk(radio_clk), .rst(radio_rst), .strobe(set_stb_user), .addr(set_addr_user), .in(set_data_user),
++         .out(pocsag_ctrl_value), .changed());
++
++      assign pocsag_sps = pocsag_ctrl_value[15:0];
++      assign pocsag_en  = pocsag_ctrl_value[16];
++
++      // GSC PHY control: same {bit16:enable, bits15:0:sps} layout as
++      // pocsag_ctrl above, just a second independent register -- both
++      // bitsync/framer chains run concurrently in fabric regardless of
++      // which one host software is actually polling (cheap: no DSP48A1
++      // cost, see gsc_bitsync/gsc_framer below). poke32(4*4, value) to
++      // set.
++      wire [31:0] gsc_ctrl_value;
++
++      setting_reg #(.my_addr(8'd4), .awidth(8), .width(32)) user_reg_gsc_ctrl
++        (.clk(radio_clk), .rst(radio_rst), .strobe(set_stb_user), .addr(set_addr_user), .in(set_data_user),
++         .out(gsc_ctrl_value), .changed());
++
++      assign gsc_sps = gsc_ctrl_value[15:0];
++      assign gsc_en  = gsc_ctrl_value[16];
++
+       always @* begin
+          case(rb_addr_user)
+             8'd0 : rb_data_user <= {user_reg_1_value, user_reg_0_value};
++            8'd1 : rb_data_user <= {63'd0, user_loopback_value[0]};
++            // peek64(2*8): {23'b0, locked, codeword_count[7:0], codeword[31:0]}
++            8'd2 : rb_data_user <= {23'd0, pocsag_locked, pocsag_codeword_count, pocsag_codeword};
++            // peek64(3*8) -- RB_GSC_STATUS: {9'b0, locked, pair_count[7:0],
++            // word1[22:0], word2[22:0]}. word1/word2 are gsc_framer's most
++            // recently captured Golay(23,12,7) codewords, raw -- FEC
++            // decode (golay.py) and message assembly (gsc.py's LiveParser)
++            // are host-side, same PHY/framing-only split pocsag_framer
++            // uses. pair_count is a free-running counter, diffed the same
++            // way as codeword_count above.
++            8'd3 : rb_data_user <= {9'd0, gsc_locked, gsc_pair_count, gsc_word1, gsc_word2};
++            // peek64(4*8) -- RB_PHY_STATUS: protocol-agnostic PHY status,
++            // shared by whatever framer is active. clip_count is
++            // clip_detect.v's free-running counter (see there for the
++            // diff-against-last-seen-value host-side convention, same as
++            // codeword_count above). width_narrow/width_locked are
++            // channel_width_detect.v's classification (see there for the
++            // calibration behind THRESHOLD_SHIFT_WIDE/NARROW).
++            8'd4 : rb_data_user <= {32'd0, channel_width_narrow, channel_width_locked,
++                                     clip_count, 22'd0};
+             default : rb_data_user <= 64'd0;
+          endcase
+       end
+ 
+    end else begin    //for USER_SETTINGS == 1
+       always @* rb_data_user <= 64'd0;
++      assign user_loopback = 1'b0;
++      assign pocsag_sps = 16'd0;
++      assign pocsag_en  = 1'b0;
++      assign gsc_sps = 16'd0;
++      assign gsc_en  = 1'b0;
+    end
+ endgenerate
+ 
+@@ -276,12 +401,20 @@ endgenerate
+ 
+    generate
+       if (FP_GPIO != 0) begin: add_fp_gpio
+-         gpio_atr #(.BASE(SR_FP_GPIO), .WIDTH(10), .FAB_CTRL_EN(0)) fp_gpio_atr
++         // DEFAULT_DDR/DEFAULT_FAB_CTRL bit 0 = 1: fp_gpio[0] comes up as an
++         // output driven by fsk_demod at reset, with no host-side register
++         // write needed -- there's no sanctioned public API path to poke
++         // SR_FSK_DEMOD or this block's fabric_ctrl mask (they're outside
++         // the USER_SETTINGS mechanism), so defaulting both at synthesis
++         // time is what makes this observable via UHD's standard GPIO
++         // readback at all.
++         gpio_atr #(.BASE(SR_FP_GPIO), .WIDTH(10), .FAB_CTRL_EN(1),
++                    .DEFAULT_DDR(10'b00_0000_0001), .DEFAULT_FAB_CTRL(10'b00_0000_0001)) fp_gpio_atr
+             (.clk(radio_clk),.reset(radio_rst),
+             .set_stb(set_stb),.set_addr(set_addr),.set_data(set_data),
+             .rx(run_rx), .tx(run_tx),
+-            .gpio_in(fp_gpio_in), .gpio_out(fp_gpio_out), .gpio_ddr(fp_gpio_ddr), 
+-            .gpio_out_fab(10'h000 /* no fabric control */), .gpio_sw_rb(fp_gpio_readback));
++            .gpio_in(fp_gpio_in), .gpio_out(fp_gpio_out), .gpio_ddr(fp_gpio_ddr),
++            .gpio_out_fab({9'b0, fsk_bit_out}), .gpio_sw_rb(fp_gpio_readback));
+       end
+    endgenerate
+ 
+@@ -443,15 +576,149 @@ endgenerate
+    wire [31:0] 	     debug_ddc_chain;
+ 
+    // Digital Loopback TX -> RX (Pipeline immediately inside rx_frontend).
+-   wire [31:0] 	     rx_fe = loopback ? tx : rx;
++   wire [31:0] 	     rx_fe = (loopback | user_loopback) ? tx : rx;
++
++   // ddc_chain's own run gate, DELIBERATELY separate from run_rx (which
++   // new_rx_control/new_rx_framer/gpio_atr still use unchanged, below and
++   // above). run_rx drops to 0 the instant the host-facing framing FIFO
++   // backs up (new_rx_control.v: `assign run = (ibs_state ==
++   // IBS_RUNNING)`, leaves that state on `strobe && full`) -- which
++   // previously stalled ddc_chain too, since it shared that same signal,
++   // meaning the whole custom PHY chain (channel filter, fsk_demod, both
++   // bitsync/framer pairs, clip_detect, channel_width_detect -- all
++   // tapped off ddc_chain's own sample_rx/strobe_rx) went idle unless the
++   // host kept continuously draining rx_streamer.recv() at full rate,
++   // even though none of that PHY logic needs the USB-facing packet path
++   // at all (it's read back entirely through USER_SETTINGS registers).
++   // Confirmed empirically on real hardware: with stream_cmd(start_cont)
++   // issued once but zero subsequent recv() calls, register-visible
++   // decode progress stopped within a handful of seconds -- this fixes
++   // that. ddc_chain's `run` is just a level-sensitive enable throughout
++   // (uhd/fpga/usrp3/lib/dsp/ddc_chain.v: CORDIC/CIC-strober/both
++   // halfband decimators all take it as `.enable()`/`.run()` directly);
++   // the only other effect of holding it low is resetting the NCO phase
++   // accumulator, harmless to avoid by holding this at 1 whenever
++   // either protocol's decode is enabled. new_rx_control/new_rx_framer's
++   // own run_rx (and both gpio_atr instances' ATR wiring) are completely
++   // untouched -- the actual USB packet path still gates exactly as
++   // before; this only lets the decimator (and everything downstream of
++   // it in fabric) keep running independent of whether the host asks
++   // for/drains a packetized RX stream at all.
++   wire               run_rx_fabric = pocsag_en | gsc_en;
+ 
+    ddc_chain #(.BASE(SR_RX_DSP), .DSPNO(0), .WIDTH(24), .NEW_HB_DECIM(NEW_HB_DECIM), .DEVICE(DEVICE)) ddc_chain
+      (.clk(radio_clk), .rst(radio_rst), .clr(1'b0),
+       .set_stb(set_stb),.set_addr(set_addr),.set_data(set_data),
+       .rx_fe_i({rx_fe[31:16],8'd0}),.rx_fe_q({rx_fe[15:0],8'd0}),
+-      .sample(sample_rx), .run(run_rx), .strobe(strobe_rx),
++      .sample(sample_rx), .run(run_rx_fabric), .strobe(strobe_rx),
+       .debug(debug_ddc_chain) );
+ 
++   // /////////////////////////////////////////////////////////////////////////////////
++   //  RX front-end clipping detection (see clip_detect.v) -- a parallel tap
++   //  off sample_rx/strobe_rx, same as the channel filter below and for the
++   //  same reason (doesn't touch the primary RX data path). Read via
++   //  USER_SETTINGS (peek64(4*8), RB_PHY_STATUS) -- see the readback case
++   //  statement above.
++
++   clip_detect clip_detect
++     (.clk(radio_clk), .reset(radio_rst),
++      .strobe_rx(strobe_rx), .sample_rx(sample_rx),
++      .clip_count(clip_count));
++
++   // /////////////////////////////////////////////////////////////////////////////////
++   //  Channel filter ahead of the FSK discriminator (see pocsag_channel_filter.v):
++   //  a narrowband FIR lowpass, ~20kHz cutoff, sized to POCSAG's real occupied
++   //  bandwidth rather than the DDC's full output bandwidth. Fixes a measured
++   //  FM-discriminator "threshold effect" -- a delay-and-multiply discriminator's
++   //  SNR scales with deviation^2 for a *fixed* input noise bandwidth, so without
++   //  this, standard +/-4500Hz POCSAG deviation collapsed completely on real RF
++   //  while a much larger deviation worked. This is a parallel tap off
++   //  sample_rx/strobe_rx -- it doesn't touch the primary RX data path anything
++   //  else (new_rx_framer, etc.) consumes.
++
++   wire        pocsag_filt_strobe;
++   wire [31:0] pocsag_filt_sample;
++
++   pocsag_channel_filter pocsag_channel_filter
++     (.clk(radio_clk), .reset(radio_rst),
++      .strobe_in(strobe_rx), .sample_in(sample_rx),
++      .strobe_out(pocsag_filt_strobe), .sample_out(pocsag_filt_sample));
++
++   // /////////////////////////////////////////////////////////////////////////////////
++   //  FSK demodulator (delay-and-multiply discriminator, bit decision only --
++   //  see fsk_demod.v). Tapped off the channel filter above (not sample_rx/
++   //  strobe_rx directly -- see its comment); drives fp_gpio[0] directly from
++   //  fabric, bypassing the normal ATR mux, so the bit stream shows up on the
++   //  pin in real time with no software in the per-symbol path. Host must set
++   //  bit 0 of the SR_FP_GPIO+6 mask (the gpio_atr FAB_CTRL_EN register) to
++   //  hand that pin over to fabric control; it defaults to software/ATR-driven
++   //  like every other fp_gpio bit.
++
++   fsk_demod #(.BASE(SR_FSK_DEMOD)) fsk_demod
++     (.clk(radio_clk), .reset(radio_rst),
++      .set_stb(set_stb), .set_addr(set_addr), .set_data(set_data),
++      .strobe(pocsag_filt_strobe), .sample(pocsag_filt_sample),
++      .bit_out(fsk_bit_out), .bit_valid(fsk_bit_valid),
++      .disc_out(fsk_disc_out), .disc_valid(fsk_disc_valid));
++
++   // /////////////////////////////////////////////////////////////////////////////////
++   //  Channel width (12.5kHz vs 25kHz) auto-detection -- see
++   //  channel_width_detect.v for the full writeup (estimates FSK deviation
++   //  from the discriminator's statistical swing rather than running a
++   //  second, DSP48A1-expensive bandpass filter pair). Parallel tap off
++   //  the same filtered signal fsk_demod itself consumes, plus fsk_demod's
++   //  own new disc_out/disc_valid outputs above.
++
++   channel_width_detect channel_width_detect
++     (.clk(radio_clk), .reset(radio_rst),
++      .strobe(pocsag_filt_strobe), .sample(pocsag_filt_sample),
++      .disc(fsk_disc_out), .disc_valid(fsk_disc_valid),
++      .width_narrow(channel_width_narrow), .width_locked(channel_width_locked));
++
++   // /////////////////////////////////////////////////////////////////////////////////
++   //  POCSAG PHY: bit-timing recovery + batch/frame sync, straight off the
++   //  fsk_demod discriminator. Reachable entirely through USER_SETTINGS
++   //  (poke32(3*4,...) to configure/enable, peek64(2*8) to read back the
++   //  latest codeword) -- see the pocsag_ctrl register above. BCH decode
++   //  and message assembly are left to host software; this is PHY/framing
++   //  only, same division of labor as fsk_demod.
++
++   wire pocsag_sym_bit, pocsag_sym_valid;
++
++   pocsag_bitsync pocsag_bitsync
++     (.clk(radio_clk), .reset(radio_rst), .en(pocsag_en), .sps(pocsag_sps),
++      .raw_bit(fsk_bit_out), .raw_bit_valid(fsk_bit_valid), .framer_locked(pocsag_locked),
++      .sym_bit(pocsag_sym_bit), .sym_valid(pocsag_sym_valid));
++
++   pocsag_framer pocsag_framer
++     (.clk(radio_clk), .reset(radio_rst), .en(pocsag_en),
++      .sym_bit(pocsag_sym_bit), .sym_valid(pocsag_sym_valid),
++      .codeword(pocsag_codeword), .codeword_valid(pocsag_codeword_valid),
++      .codeword_count(pocsag_codeword_count), .locked(pocsag_locked));
++
++   // /////////////////////////////////////////////////////////////////////////////////
++   //  GSC PHY: same fsk_demod bit stream as POCSAG above, a second
++   //  bit-timing recovery + block-sync chain running concurrently in
++   //  fabric (see gsc_framer.v for the framing writeup and why this
++   //  project's own GSC convention resyncs on a comma before every block
++   //  rather than tracking POCSAG-style fixed-length batches). Reuses
++   //  pocsag_bitsync as-is -- it was already protocol-agnostic, nothing
++   //  GSC-specific needed there, just its own sps/en (poke32(4*4,...),
++   //  peek64(3*8) to read back -- see the gsc_ctrl register above).
++
++   wire gsc_sym_bit, gsc_sym_valid;
++
++   pocsag_bitsync gsc_bitsync
++     (.clk(radio_clk), .reset(radio_rst), .en(gsc_en), .sps(gsc_sps),
++      .raw_bit(fsk_bit_out), .raw_bit_valid(fsk_bit_valid), .framer_locked(gsc_locked),
++      .sym_bit(gsc_sym_bit), .sym_valid(gsc_sym_valid));
++
++   gsc_framer gsc_framer
++     (.clk(radio_clk), .reset(radio_rst), .en(gsc_en),
++      .sym_bit(gsc_sym_bit), .sym_valid(gsc_sym_valid),
++      .word1(gsc_word1), .word2(gsc_word2),
++      .pair_valid(gsc_pair_valid), .pair_count(gsc_pair_count), .locked(gsc_locked));
++
+ `ifdef DELETE_FORMAT_CONVERSION
+    assign 	     rx_prefc_tdata_r = rx_tdata_i;
+    assign 	     rx_prefc_tlast_r = rx_tlast_i;
+diff --git a/fpga/usrp3/top/b2xxmini/Makefile.b205.inc b/fpga/usrp3/top/b2xxmini/Makefile.b205.inc
+index a1da7f22f..9a9d61c16 100644
+--- a/fpga/usrp3/top/b2xxmini/Makefile.b205.inc
++++ b/fpga/usrp3/top/b2xxmini/Makefile.b205.inc
+@@ -14,6 +14,17 @@ CUSTOM_SRCS =
+ CUSTOM_DEFS =
+ 
+ include ../Makefile.common
++
++# Upstream bug workaround: Makefile.common's `bin` target depends on both
++# $(BIN_FILE) and $(BIT_FILE), but only ever defines a recipe for
++# $(BIN_FILE) -- Make errors "No rule to make target ... .bit" on a clean
++# build since $(BIT_FILE) has neither a rule nor an existing file. In
++# reality the BIN_FILE recipe's "Generate Programming File" ISE step
++# produces both .bin and .bit as real outputs of the same bitgen run, so
++# just declare the dependency (no separate recipe needed) rather than
++# re-running anything.
++$(BIT_FILE): $(BIN_FILE)
++
+ include ../../lib/gpif2/Makefile.srcs
+ include ../../lib/fifo/Makefile.srcs
+ include ../../lib/fifo_200/Makefile.srcs
+diff --git a/fpga/usrp3/top/b2xxmini/b205_core.v b/fpga/usrp3/top/b2xxmini/b205_core.v
+index d78ff374c..9b2ca7cdf 100644
+--- a/fpga/usrp3/top/b2xxmini/b205_core.v
++++ b/fpga/usrp3/top/b2xxmini/b205_core.v
+@@ -231,7 +231,10 @@ module b205_core
+         .NEW_HB_INTERP(1),
+         .NEW_HB_DECIM(1),
+         .SOURCE_FLOW_CONTROL(0),
+-        .USER_SETTINGS(0),
++        .USER_SETTINGS(1), // enables get_user_settings_iface() -- used to reach the
++                            // loopback-control register (see radio_legacy.v) from host
++                            // software, e.g. for closed-loop testing of fsk_demod.
++
+         .DEVICE("SPARTAN6")
+     ) radio (
+         .radio_clk(radio_clk), .radio_rst(radio_rst),
+diff --git a/fpga/usrp3/top/b2xxmini/coregen/coregen.cgp b/fpga/usrp3/top/b2xxmini/coregen/coregen.cgp
+index 127790678..1164a26f3 100644
+--- a/fpga/usrp3/top/b2xxmini/coregen/coregen.cgp
++++ b/fpga/usrp3/top/b2xxmini/coregen/coregen.cgp
+@@ -1,6 +1,6 @@
+ SET busformat = BusFormatAngleBracketNotRipped
+ SET designentry = Verilog
+-SET device = xc6slx150
++SET device = xc6slx75
+ SET devicefamily = spartan6
+ SET flowvendor = Foundation_ISE
+ SET package = csg484
+diff --git a/fpga/usrp3/top/b2xxmini/coregen_dsp/coregen.cgp b/fpga/usrp3/top/b2xxmini/coregen_dsp/coregen.cgp
+index e849e744f..27ed48381 100644
+--- a/fpga/usrp3/top/b2xxmini/coregen_dsp/coregen.cgp
++++ b/fpga/usrp3/top/b2xxmini/coregen_dsp/coregen.cgp
+@@ -1,6 +1,6 @@
+ SET busformat = BusFormatAngleBracketNotRipped
+ SET designentry = Verilog
+-SET device = xc6slx150
++SET device = xc6slx75
+ SET devicefamily = spartan6
+ SET flowvendor = Other
+ SET package = csg484
