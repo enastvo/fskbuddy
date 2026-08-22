@@ -38,19 +38,15 @@ need to be custom. What *does* need to be custom is the FPGA bitstream
 itself (see "Architecture" below for exactly which modules are added on
 top of the stock b2xxmini image), and a pre-built one ships right in this
 repo at `fpga/b205.bit` -- `modem.py` finds and loads it automatically,
-no separate checkout or build step needed for normal use. See
-`fpga/README.md` for exactly what's in that directory (the bitstream,
-its complete corresponding source as a patch against upstream UHD, and
-the Xilinx ISE build environment used to produce it -- all included
-since GPLv3 requires the corresponding source travel with any binary
-this project distributes) and for optional persistent-flashing
-instructions if you want the device to boot this image without FSK
-Buddy specifying it each time. Building your own from source needs
-Xilinx ISE 14.7 (a licensed, discontinued Xilinx tool that only runs
-containerized) -- see `fpga/docker/README.md` -- and isn't part of *this*
-repo's own install; `fskbuddy.py`/the TUI will raise a clear, specific
-error naming the path it expected if `fpga/b205.bit` is somehow missing,
-rather than fail confusingly deep inside UHD.
+no separate checkout or build step needed. See `fpga/README.md` for how
+that load works (transient, per session, nothing persistent by default),
+optional instructions for permanently flashing it to the device instead,
+and a source-availability note (this distribution ships the bitstream
+only, not the FPGA RTL source or build tooling -- see that file for how
+to request the corresponding source, as GPLv3 requires). `fskbuddy.py`/
+the TUI will raise a clear, specific error naming the path it expected
+if `fpga/b205.bit` is somehow missing, rather than fail confusingly deep
+inside UHD.
 
 **3. Python venv, for the TUI only:**
 
