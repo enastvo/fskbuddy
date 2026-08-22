@@ -39,13 +39,14 @@ itself (see "Architecture" below for exactly which modules are added on
 top of the stock b2xxmini image), and a pre-built one ships right in this
 repo at `fpga/b205.bit` -- `modem.py` finds and loads it automatically,
 no separate checkout or build step needed. See `fpga/README.md` for how
-that load works (transient, per session, nothing persistent by default),
-optional instructions for permanently flashing it to the device instead,
-and a source-availability note (this distribution ships the bitstream
-only, not the FPGA RTL source or build tooling -- see that file for how
-to request the corresponding source, as GPLv3 requires). `fskbuddy.py`/
-the TUI will raise a clear, specific error naming the path it expected
-if `fpga/b205.bit` is somehow missing, rather than fail confusingly deep
+that load actually works (transient over USB, every session -- the
+B200mini has no persistent flash for the FPGA image at all, confirmed
+directly in UHD's own source, not assumed) and a source-availability
+note (this distribution ships the bitstream only, not the FPGA RTL
+source or build tooling -- see that file for how to request the
+corresponding source, as GPLv3 requires). `fskbuddy.py`/the TUI will
+raise a clear, specific error naming the path it expected if
+`fpga/b205.bit` is somehow missing, rather than fail confusingly deep
 inside UHD.
 
 **3. Python venv, for the TUI only:**
