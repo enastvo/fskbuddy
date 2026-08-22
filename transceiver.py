@@ -31,7 +31,7 @@ import uhd
 import pocsag as p
 import gsc
 from modem import (open_usrp, modulate_cpfsk, REG_POCSAG_CTRL, RB_POCSAG_STATUS,
-                   REG_GSC_CTRL, RB_GSC_STATUS, RB_PHY_STATUS)
+                   REG_GSC_CTRL, RB_GSC_STATUS, RB_PHY_STATUS, FSKB_MAGIC, FSKB_VERSION)
 
 DEFAULT_FREQ = 929.6625e6
 DEFAULT_RATE = 1e6
@@ -144,6 +144,10 @@ class PocsagReceiver:
         self.clipping = False
         self.channel_width_narrow = False  # default wide -- matches channel_width_detect.v's reset state
         self.channel_width_locked = False
+        self.fpga_identity_checked = False  # set once in start(), see there
+        self.fpga_identity_ok = False       # True iff FSKB_MAGIC matched -- this really is
+                                             # the FSK Buddy image, not just "asked for" it
+        self.fpga_version = None
 
     @property
     def running(self):
@@ -172,6 +176,30 @@ class PocsagReceiver:
         if self.running:
             return
         self._stop_event.clear()
+        # Identity check -- confirms the FPGA fabric actually configured
+        # right now is genuinely this project's own image, not just
+        # whatever file was asked for at load time (which, per the fpga/
+        # README's own writeup, isn't itself a guarantee -- UHD's load-time
+        # log line can go quiet even when the wrong image turns out to be
+        # running). Safe to do here, before the RX thread exists yet -- see
+        # the module docstring's threading contract; this is a single
+        # peek64 from whatever thread called start(), same as the
+        # protocol-enable pokes right below.
+        phy_status = self.regs.peek64(RB_PHY_STATUS * 8)
+        magic = (phy_status >> 48) & 0xFFFF
+        version = (phy_status >> 32) & 0xFFFF
+        self.fpga_identity_ok = (magic == FSKB_MAGIC)
+        self.fpga_version = version if self.fpga_identity_ok else None
+        self.fpga_identity_checked = True
+        if self.fpga_identity_ok:
+            self._safe_callback(self.on_log,
+                                 f"FPGA identity confirmed: FSK Buddy image, version 0x{version:04x}")
+        else:
+            self._safe_callback(
+                self.on_log,
+                f"WARNING: FPGA identity check FAILED (read magic=0x{magic:04x}, "
+                f"expected 0x{FSKB_MAGIC:04x}) -- this does not look like the FSK Buddy "
+                f"FPGA image. Decode will likely not work. See fpga/README.md.")
         # Enable only the selected protocol's chain -- both can run
         # concurrently in fabric for free (see radio_legacy.v), but there's
         # no reason to decode Golay/BCH for the one nothing's listening to,
@@ -388,7 +416,9 @@ class PocsagReceiver:
             self._safe_callback(self.on_status, locked=self.locked, n_codewords=self.n_codewords,
                                  n_pages=self.n_pages, bitrate=self.bitrate, clipping=self.clipping,
                                  channel_width_narrow=self.channel_width_narrow,
-                                 channel_width_locked=self.channel_width_locked)
+                                 channel_width_locked=self.channel_width_locked,
+                                 fpga_identity_ok=self.fpga_identity_ok,
+                                 fpga_version=self.fpga_version)
 
     def _compute_spectrum(self, samples):
         """FFT magnitude (dB), cropped to the center SPECTRUM_DISPLAY_SPAN_HZ

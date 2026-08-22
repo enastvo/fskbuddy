@@ -56,6 +56,20 @@ command and that couldn't be independently re-verified against real
 hardware before publishing; if you hit any issue with `.bit` here, try
 `.bin` instead and please report back which one actually worked.
 
+## Telling which image is actually running
+
+Because none of the above is persistent, and because UHD's own
+"Loading FPGA image" log line turned out to be an unreliable way to
+tell (it's driven by a host-tracked hash, not a fresh read of the chip
+-- confirmed on real hardware to stay silent even when a *different*
+image was actually configured), this build carries its own hardware
+identity marker: `RB_PHY_STATUS`'s top 32 bits (`radio_legacy.v`) hold a
+fixed magic value + version, checked by `PocsagReceiver.start()` in
+`transceiver.py` every time RX starts. The TUI's STATUS panel shows the
+result directly (`FSK Buddy v0x0001` in green, or a red
+`UNRECOGNIZED -- wrong image!`); the CLI logs the same check at startup.
+See the main README's "The TUI panels, in detail" section for more.
+
 ## Source availability (GPLv3)
 
 This bitstream is built from modified USRP `radio_200` FPGA RTL (custom

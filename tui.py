@@ -445,6 +445,10 @@ class PocsagTUI(App):
         self.clipping = False
         self.channel_width_narrow = False
         self.channel_width_locked = False
+        self.fpga_identity_checked = False  # see PocsagReceiver.start() -- set on the
+                                             # first status update after RX starts
+        self.fpga_identity_ok = False
+        self.fpga_version = None
         self.rx_running = False
         self.n_codewords = 0
         self.n_pages_rx = 0
@@ -712,11 +716,22 @@ class PocsagTUI(App):
             lock_str = "YES" if self.locked else "no"
             rx_str = "RUNNING" if self.rx_running else "stopped"
             clip_str = "[#ff5555 bold]YES -- lower RX gain![/]" if self.clipping else "no"
+            # FPGA identity -- see PocsagReceiver.start()/RB_PHY_STATUS. Not
+            # just "which file did we ask for": a fresh hardware readback,
+            # since UHD's own load-time log line has been observed to go
+            # quiet even when the wrong image ends up running.
+            if not self.fpga_identity_checked:
+                fpga_str = "checking..."
+            elif self.fpga_identity_ok:
+                fpga_str = f"FSK Buddy v0x{self.fpga_version:04x}"
+            else:
+                fpga_str = "[#ff5555 bold]UNRECOGNIZED -- wrong image![/]"
             self.query_one("#status-content", Static).update(
                 f"RIG      {'ONLINE' if self.rig_online else 'connecting...'}\n"
                 f"RX       {rx_str}\n"
                 f"LOCK     {lock_str}\n"
                 f"CLIPPING {clip_str}\n"
+                f"FPGA     {fpga_str}\n"
                 f"Codewords {self.n_codewords}\n"
                 f"Pages RX  {self.n_pages_rx}   TX  {self.n_pages_tx}"
             )
@@ -753,6 +768,10 @@ class PocsagTUI(App):
         self.n_codewords = kw.get("n_codewords", self.n_codewords)
         self.channel_width_narrow = kw.get("channel_width_narrow", self.channel_width_narrow)
         self.channel_width_locked = kw.get("channel_width_locked", self.channel_width_locked)
+        if "fpga_identity_ok" in kw:
+            self.fpga_identity_checked = True
+            self.fpga_identity_ok = kw["fpga_identity_ok"]
+            self.fpga_version = kw.get("fpga_version")
         self._refresh_panels()
 
     def _on_spectrum(self, mags, rate):

@@ -44,12 +44,28 @@ RB_GSC_STATUS = 3       # peek64(3*8) -> {9'b0, locked, pair_count[7:0], word1[2
                          # pocsag_framer/RB_POCSAG_STATUS uses). pair_count is
                          # free-running, diffed the same way as POCSAG's codeword count.
 RB_PHY_STATUS = 4       # peek64(4*8) -> protocol-agnostic PHY status:
-                         # {32'b0, width_narrow[1], width_locked[1], clip_count[7:0], 22'b0}.
-                         # clip_count is clip_detect.v's free-running counter, diffed the
+                         # {magic[15:0], version[15:0], width_narrow[1], width_locked[1],
+                         # clip_count[7:0], 22'b0}. magic/version are a hardware-level
+                         # identity marker (radio_legacy.v's FSKB_MAGIC/FSKB_VERSION) --
+                         # confirms this specific custom image is actually configured on
+                         # the FPGA right now, rather than inferring it from which file
+                         # was asked for at load time (UHD's own "Loading FPGA image" log
+                         # line can go quiet even when the wrong image is running --
+                         # confirmed on real hardware, not theoretical -- since it's based
+                         # on a host-tracked hash, not a fresh read of the chip). See
+                         # FSKB_MAGIC/FSKB_VERSION below. clip_count is clip_detect.v's
+                         # free-running counter, diffed the
                          # same way as codeword count above. width_narrow/width_locked are
                          # channel_width_detect.v's classification (1=12.5kHz-style
                          # narrowband, 0=25kHz-style wideband; see there for the
                          # empirical-deviation-measurement approach and calibration data).
+
+# Must match radio_legacy.v's own FSKB_MAGIC/FSKB_VERSION localparams
+# exactly -- these are the expected values, not computed from anything;
+# a real device that reads back something else is running a different
+# (older, newer, or entirely unrelated) FPGA image.
+FSKB_MAGIC = 0xF5CB
+FSKB_VERSION = 0x0001
 
 
 def list_devices():

@@ -374,6 +374,21 @@ found actually locks and decodes cleanly; still just a starting point to
 dial in for your own antenna distance/link budget, not a guarantee for
 every setup.
 
+**FPGA** in the Status panel is a hardware identity check, not just "which
+file did we ask for." `RB_PHY_STATUS`'s top 32 bits (previously always
+zero) now carry a fixed `FSKB_MAGIC`/`FSKB_VERSION` pair
+(`radio_legacy.v`), read back once via `peek64` right as RX starts
+(`PocsagReceiver.start()` in `transceiver.py`) and shown as `FSK Buddy
+v0x0001` in green, or a red `UNRECOGNIZED -- wrong image!` if the magic
+doesn't match. This exists because UHD's own "Loading FPGA image" log
+line turned out not to be trustworthy for this: it's driven by a
+host-tracked hash comparison, not a fresh read of the chip, and was
+observed on real hardware to go quiet -- implying nothing needed
+reloading -- even when the device was demonstrably running a different
+(e.g. stock) image. A register read of the fabric's own state doesn't
+have that ambiguity. Headless CLI use (`listen`) gets the same check --
+logged via `on_log` at startup rather than a dedicated panel.
+
 **Channel** (12.5kHz "narrow" vs 25kHz "wide") in the FREQUENCY/MODE panel
 auto-detects the RX channel width in FPGA fabric (`channel_width_detect.v`),
 shown as "detecting..." until it settles. Rather than running a second
