@@ -42,19 +42,32 @@ this one -- a host-side file swap, not a device operation. Not something
 this project sets up automatically, since it'd affect every UHD session
 on the machine, not just FSK Buddy's.
 
-To trigger the transient load standalone, outside of FSK Buddy:
+To trigger the transient load standalone, outside of FSK Buddy, first
+confirm the device is healthy:
 
 ```
-uhd_find_devices                 # confirm the device is healthy first
+uhd_find_devices
+```
+
+Then load whichever file you prefer -- both go through the identical
+`load_fpga()` code path in UHD, so there's no functional difference
+between them, just the 107-byte `.bit` header:
+
+```
+# Using the .bit file (has the Xilinx header):
 uhd_image_loader --args="type=b200" --fpga-path=fpga/b205.bit
+
+# Using the .bin file (raw config data, no header) -- equivalent:
+uhd_image_loader --args="type=b200" --fpga-path=fpga/b205.bin
 ```
 
-Both `.bit` and `.bin` should work here -- they go through the identical
-code path either way. `.bin` is included specifically because an earlier
-version of this project's own build notes called for it in this exact
-command and that couldn't be independently re-verified against real
-hardware before publishing; if you hit any issue with `.bit` here, try
-`.bin` instead and please report back which one actually worked.
+Both commands were run back-to-back against real hardware as part of
+this project's own testing (immediately re-probed with a register-level
+loopback + decode check, not just watching the log output) and behaved
+identically: the load succeeds either way, and -- consistent with
+"How this actually gets onto the FPGA" above -- neither survives a
+power cycle. Use whichever format you have on hand; there's no reason
+to prefer one over the other for this command specifically.
 
 ## Telling which image is actually running
 
